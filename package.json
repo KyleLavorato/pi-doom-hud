@@ -1,7 +1,7 @@
 {
   "name": "pi-doom-hud",
   "version": "1.0.0",
-  "description": "Doom-style status bar extension for the Pi coding agent: steel panels, bitmap digits, and an animated Doom Guy face driven by live session stats",
+  "description": "Doom-style Pi status bar with a high-resolution image face, universal quadrant-block fallback, live context and cost stats, and test-health controls",
   "type": "module",
   "license": "MIT",
   "author": "Kyle Lavorato <kyle.lavorato@gmail.com>",
@@ -20,20 +20,23 @@
     "extension"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "pi": {
     "extensions": [
       "./extensions/doom-hud/index.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/KyleLavorato/pi-doom-hud/main/docs/hud-tier3.png"
   },
   "files": [
     "extensions",
+    "docs",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
+    "test": "tsx scripts/check-render.ts && tsx scripts/check-image.ts",
     "typecheck": "tsc --noEmit",
     "preview": "tsx scripts/preview.ts"
   },
@@ -50,9 +53,9 @@
     }
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.87.0",
-    "@earendil-works/pi-tui": "^0.87.0",
-    "@types/node": "^20.19.0",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@earendil-works/pi-tui": "0.87.1",
+    "@types/node": "^22.0.0",
     "tsx": "^4.21.0",
     "typescript": "5.9.3"
   }

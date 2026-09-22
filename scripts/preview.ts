@@ -27,14 +27,15 @@ const pctArg = process.argv[5];
 const usagePct = pctArg === undefined ? 45 : pctArg === "null" ? null : Number(pctArg);
 const frames = await loadFrames();
 const hud: HudData = {
-	health: 100 - (usagePct ?? 0), usagePct, window: 200_000, cost: 1.694,
+	health: 100 - (usagePct ?? 0), usagePct,
+	contextTokens: usagePct == null ? null : Math.round(200_000 * (usagePct / 100)),
+	window: 200_000, cost: 1.694,
 	stats: [
 		{ label: "CACHE", value: "98%" },
 		{ label: "IN", value: "18.4k" },
 		{ label: "OUT", value: "534" },
 		{ label: "BLENDED", value: "$1.203" },
 	],
-	model: "anthropic/claude-opus-4-5[high]",
 	modelId: "claude-opus-4-5", thinking: "high", provider: "anthropic",
 	branch: "main", dir: "my-project",
 };

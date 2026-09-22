@@ -36,7 +36,8 @@
  * a washed out, blocky mess, strictly worse than half-blocks. Quadrants exist
  * in every terminal font and fill their subpixels solidly.
  *
- * Set DOOM_HUD_IMAGE=0 to force the text face.
+ * The pixel face is the default where Pi reports image support. Use /doomhud text
+ * to switch to the quadrant-block fallback, or /doomhud image to retry the pixel face.
  *
  *   faces/ holds the exact Doom health faces:
  *     tier1..tier5  ×  left / neutral / right / focus
@@ -45,16 +46,15 @@
  *   There is no separate "fresh" face: an empty context is just full health, so
  *   a new session shows the healthiest tier like any other healthy session.
  * Data mapping (real session stats, from pi's context + session entries).
- * Labels describe what each panel actually holds:
+ * What each panel actually holds:
  *   CONTEXT = context usage %, driving both the display and the face tier
- *   TOKENS  = cumulative tokens used this session
+ *   TOKENS  = the model's context window (the capacity CONTEXT is a % of)
+ *   MODEL   = the model id (wrapped on "-"), the thinking level on a line
+ *             beneath it, and the provider underneath that
  *   COST    = session spend in USD, three decimals, as the big value.
  *             Includes assistant + toolResult usage, compaction and
  *             branch-summary calls, and subagent spend resolved from the
  *             pi-subagents artifacts, so it matches pi's own footer
- *   TOKENS  = the model's context window (the capacity CONTEXT is a % of)
- *   MODEL   = the model id (wrapped on "-"), the thinking level on a line
- *             beneath it, and the provider underneath that
  *   right tile rows: the session's token economics, recomputed as it runs
  *     CACHE   = prompt-cache hit rate, i.e. the share of prompt served from cache
  *     IN      = fresh input tokens
@@ -62,11 +62,6 @@
  *     BLENDED = total spend / every billed token, three decimals. Note this is
  *               dominated by cache reads (typically a twentieth of the input
  *               price), so it sits far below the sticker input/output prices
- *   AMMO LIST rows (cur/max):
- *     CTX    = current context occupancy / window (not cumulative tokens)
- *     AGENTS = subagent runs
- *     TOOLS  = tool calls
- *     MSGS   = messages
  *
  * Context colours follow pi's footer thresholds: 90%+ red, 70%+ amber,
  * otherwise green, with a dim dash when usage is unknown (right after a
@@ -88,7 +83,7 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
-import { encodeKitty, getCapabilities, getCellDimensions } from "@earendil-works/pi-tui";
+import { encodeKitty, getCapabilities, getCellDimensions, visibleWidth } from "@earendil-works/pi-tui";
 import { readFile, readdir } from "node:fs/promises";
 import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -106,13 +101,22 @@ interface DecodedPng {
 }
 
 function decodePng(buf: Buffer): DecodedPng {
+	// Reject anything that is not a PNG up front; the rest of this function
+	// trusts the offsets it reads.
+	const PNG_SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+	for (let i = 0; i < PNG_SIG.length; i++) {
+		if (buf[i] !== PNG_SIG[i]) throw new Error("not a PNG");
+	}
 	let off = 8;
 	let width = 0, height = 0, bitDepth = -1, colorType = -1, interlace = -1;
 	const idat: Buffer[] = [];
-	while (off < buf.length) {
+	while (off + 8 <= buf.length) {
 		const len = buf.readUInt32BE(off);
+		// Every chunk needs its 12 bytes of length/type/CRC plus the payload.
+		if (len > buf.length - off - 12) throw new Error("truncated PNG chunk");
 		const type = buf.slice(off + 4, off + 8).toString("ascii");
 		if (type === "IHDR") {
+			if (len < 13) throw new Error("short IHDR");
 			width = buf.readUInt32BE(off + 8);
 			height = buf.readUInt32BE(off + 12);
 			bitDepth = buf[off + 16]!;
@@ -124,6 +128,7 @@ function decodePng(buf: Buffer): DecodedPng {
 		off += 12 + len;
 		if (type === "IEND") break;
 	}
+	if (width <= 0 || height <= 0) throw new Error("PNG has no usable dimensions");
 	// Only the layouts the face sprites actually use are supported: 8-bit
 	// truecolour with or without alpha, and never interlaced. Anything else used
 	// to be silently misread as 3-channel data (a palette PNG would decode to
@@ -138,14 +143,18 @@ function decodePng(buf: Buffer): DecodedPng {
 		throw new Error("interlaced PNGs are not supported");
 	}
 	const channels = colorType === 6 ? 4 : 3;
+	if (idat.length === 0) throw new Error("PNG has no image data");
 	const raw = inflateSync(Buffer.concat(idat));
 	const bpp = channels;
 	const stride = width * bpp;
+	// Each scanline carries a leading filter byte.
+	if (raw.length < (stride + 1) * height) throw new Error("truncated PNG scanlines");
 	const out = Buffer.alloc(height * stride);
 	let prev = Buffer.alloc(stride);
 	let p = 0;
 	for (let y = 0; y < height; y++) {
 		const ft = raw[p++]!;
+		if (ft > 4) throw new Error(`unsupported PNG filter ${ft}`);
 		const cur = Buffer.alloc(stride);
 		for (let x = 0; x < stride; x++) {
 			const a = x >= bpp ? cur[x - bpp]! : 0;
@@ -182,11 +191,9 @@ interface Frame {
 }
 
 const TIERS = [1, 2, 3, 4, 5] as const;
-// Short health-band labels (no "BADLY WOUNDED", no percentage, keep it clean).
-const BANDS = [
-	{ label: "HEALTHY" }, { label: "HIT" }, { label: "HURT" },
-	{ label: "WOUNDED" }, { label: "CRITICAL" },
-];
+// The five Doom health bands the face tiers map onto. Only the count is used:
+// HEALTHY, HIT, HURT, WOUNDED, CRITICAL.
+const BAND_COUNT = 5;
 // Bar height in terminal rows. The widget is a *component* widget, so it is NOT
 // line-capped to 10 rows, and height is what buys face detail: more bar rows
 // means more face rows.
@@ -204,7 +211,6 @@ const HUD = {
 	steelTex: { r: 55, g: 55, b: 61 },    // speckle shade, for the metal grime
 	bg: { r: 24, g: 24, b: 28 },          // gutter between panels
 	red: { r: 214, g: 26, b: 20 },        // digital numbers
-	redDark: { r: 120, g: 18, b: 14 },    // dim red (max values)
 	white: { r: 224, g: 220, b: 210 },    // labels
 	grey: { r: 150, g: 148, b: 142 },     // dim labels / separators
 	green: { r: 104, g: 196, b: 88 },     // context comfortable (success)
@@ -468,15 +474,17 @@ function stableFaceAspect(frames: Map<string, Frame>): number {
 
 // git branch per cwd. Cached, because running git on every refresh keeps the
 // UI from falling behind in non-repo directories, but entries expire after a
-// short TTL so switching branches mid-session is still picked up.
+// short TTL so switching branches mid-session is still picked up. Bounded, so
+// visiting hundreds of directories over a long session cannot grow it forever.
 const GIT_BRANCH_TTL_MS = 30_000;
+const GIT_BRANCH_CACHE_MAX = 64;
 const gitBranchCache = new Map<string, { branch: string; at: number }>();
 
 /** Doom's exact pain-level formula (st_stuff.c ST_calcPainOffset). */
 function bandFor(usage: number): number {
 	const health = 100 - usage;
-	if (health <= 0) return BANDS.length; // no health left: clamp to the worst tier
-	const pain = Math.min(BANDS.length - 1, Math.max(0, ((100 - health) * 5) / 101 | 0));
+	if (health <= 0) return BAND_COUNT; // no health left: clamp to the worst tier
+	const pain = Math.min(BAND_COUNT - 1, Math.max(0, ((100 - health) * 5) / 101 | 0));
 	return pain;
 }
 
@@ -494,12 +502,12 @@ interface AssistantUsage {
 export interface HudData {
 	health: number;          // 0-100, 100 − context usage % (drives the face tier)
 	usagePct: number | null; // 0-100 context usage, or null when unknown
+	contextTokens: number | null; // current context occupancy, used for test overrides
 	window: number;          // model context window in tokens (the TOKENS tile)
 	cost: number;            // session cost USD, the COST tile's big number
 	// Right-hand tile rows: label plus an already-formatted value, so all five
 	// readings share one right-aligned column.
 	stats: { label: string; value: string }[];
-	model: string;         // provider/id[thinking], the full old-status-bar label
 	modelId: string;       // the model id, the MODEL tile's big value (wraps on '-')
 	thinking: string;      // thinking level, the MODEL tile's line under the name
 	provider: string;      // model provider, the MODEL tile's caption
@@ -523,13 +531,10 @@ function collectHudData(
 ): HudData {
 	const usage = ctx.getContextUsage();
 	const usagePct = usage?.percent != null ? Math.round(usage.percent) : null;
+	const contextTokens = finiteNumber(usage?.tokens) ?? null;
 	// The face still runs on remaining health, so unknown usage counts as full
 	// health (a fresh window) rather than no health.
 	const health = Math.max(0, Math.min(100, 100 - (usagePct ?? 0)));
-	// Current context occupancy, which is NOT the same as cumulative tokens: the
-	// window can be nearly full after a few turns while the session total is many
-	// times its size. This is what pi's footer shows as "[393k]".
-	const ctxTokens = usage?.tokens ?? 0;
 
 	// The session's token economics, all reported per assistant message.
 	let tokensIn = 0;
@@ -537,31 +542,38 @@ function collectHudData(
 	let cacheRead = 0;
 	let cacheWrite = 0;
 	let cost = 0;
+	// Spend and tokens from every usage-bearing entry, so the blended rate below
+	// divides like by like. Subagent spend is tracked separately because only its
+	// cost is knowable, never its token counts.
+	let tokenCost = 0;
+	const addUsage = (u: AssistantUsage | undefined): void => {
+		if (!u) return;
+		tokensIn += finiteNumber(u.input) ?? 0;
+		tokensOut += finiteNumber(u.output) ?? 0;
+		cacheRead += finiteNumber(u.cacheRead) ?? 0;
+		cacheWrite += finiteNumber(u.cacheWrite) ?? 0;
+		tokenCost += finiteNumber(u.cost?.total) ?? 0;
+	};
 	for (const e of entries) {
 		const entry = e as Record<string, any>;
 		if (entry.type !== "message") {
 			// Compaction and tree-summarisation calls are billed too. pi's footer
 			// counts them, so the HUD has to as well or COST silently under-reports
 			// every time a long session compacts.
-			if (entry.type === "compaction" || entry.type === "branch_summary") {
-				cost += finiteNumber(entry.usage?.cost?.total) ?? 0;
+			if (entry.type === "usage" || entry.type === "compaction" || entry.type === "branch_summary") {
+				addUsage(entry.usage as AssistantUsage | undefined);
 			}
 			continue;
 		}
 		const msg = entry.message as Record<string, any> | undefined;
 		if (msg?.role === "assistant") {
-			const u = (msg as { usage?: AssistantUsage }).usage;
-			cost += u?.cost?.total ?? 0;
-			tokensIn += u?.input ?? 0;
-			tokensOut += u?.output ?? 0;
-			cacheRead += u?.cacheRead ?? 0;
-			cacheWrite += u?.cacheWrite ?? 0;
+			addUsage((msg as { usage?: AssistantUsage }).usage);
 		} else if (msg?.role === "toolResult") {
 			// Nested tool LLM usage, if pi folded any onto the message.
-			cost += toolResultCost(msg);
+			addUsage((msg as { usage?: AssistantUsage }).usage);
 		}
 	}
-	cost += subagentCost;
+	cost = tokenCost + subagentCost;
 
 	const window = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 	const thinking = ctx.thinkingLevel ?? "off";
@@ -574,7 +586,9 @@ function collectHudData(
 	const billable = tokensIn + tokensOut + cacheRead + cacheWrite;
 	const promptTokens = tokensIn + cacheRead + cacheWrite;
 	const cachePct = promptTokens > 0 ? Math.round((cacheRead / promptTokens) * 100) : 0;
-	const perMillion = billable > 0 ? (cost / billable) * 1_000_000 : 0;
+	// Token-bearing spend only: subagent cost has no token counts to divide by, so
+	// including it would inflate the rate.
+	const perMillion = billable > 0 ? (tokenCost / billable) * 1_000_000 : 0;
 	const stats = [
 		{ label: "CACHE", value: promptTokens > 0 ? `${cachePct}%` : "---" },
 		{ label: "IN", value: fmtNum(tokensIn) },
@@ -582,12 +596,8 @@ function collectHudData(
 		{ label: "BLENDED", value: perMillion > 0 ? `$${perMillion.toFixed(3)}` : "---" },
 	];
 
-	const model = ctx.model
-		? `${ctx.model.provider}/${ctx.model.id}[${thinking}]`
-		: `no-model[${thinking}]`;
-
-	// The MODEL tile shows the model id, the old status-bar shape, with the
-	// thinking level on its own line underneath and the provider beneath that.
+	// The MODEL tile shows the model id, broken on "-", with the thinking level
+	// on its own line underneath and the provider beneath that.
 	const modelId = ctx.model ? ctx.model.id : "no-model";
 	const provider = ctx.model?.provider ?? "";
 
@@ -611,27 +621,30 @@ function collectHudData(
 			branch = "";
 		}
 		gitBranchCache.set(ctx.cwd, { branch, at: now });
+		if (gitBranchCache.size > GIT_BRANCH_CACHE_MAX) {
+			// Drop the oldest insertion (and any entry already past its TTL).
+			for (const [key, entry] of gitBranchCache) {
+				if (key !== ctx.cwd && (now - entry.at >= GIT_BRANCH_TTL_MS || gitBranchCache.size > GIT_BRANCH_CACHE_MAX)) {
+					gitBranchCache.delete(key);
+				}
+				if (gitBranchCache.size <= GIT_BRANCH_CACHE_MAX) break;
+			}
+		}
 	}
 
 	return {
 		health,
 		usagePct,
+		contextTokens,
 		window,
 		cost,
 		stats,
-		model,
 		modelId,
 		thinking,
 		provider,
 		branch,
 		dir: basename(ctx.cwd),
 	};
-}
-
-/** Cost folded onto a toolResult message, if any. Guarded. */
-function toolResultCost(msg: Record<string, any>): number {
-	const c = (msg.usage as Record<string, any> | undefined)?.cost?.total;
-	return typeof c === "number" && Number.isFinite(c) ? c : 0;
 }
 
 // ── Subagent cost ────────────────────────────────────────────────────────────
@@ -645,6 +658,19 @@ const subagentCostSettled = new Set<string>();
 let subagentLoad: Promise<void> | undefined;
 /** Session file the caches belong to; a session switch drops stale entries. */
 let costSessionFile: string | undefined;
+/**
+ * Bumped whenever the caches are dropped for a new session. In-flight artifact
+ * reads capture it, so a load that started before a session switch cannot write
+ * the old session's runs into the new session's totals.
+ */
+let costGeneration = 0;
+/**
+ * How many times a run's artifacts are looked for before giving up. An async
+ * run's artifact appears a moment after it finishes, but a run whose artifact
+ * never arrives must stop being retried on every refresh.
+ */
+const SUBAGENT_COST_MAX_ATTEMPTS = 5;
+const subagentCostAttempts = new Map<string, number>();
 
 /** Sum a child artifact's cost: meta.json records `modelAttempts[].usage.cost`. */
 function subagentCostFromArtifact(meta: unknown): number {
@@ -665,8 +691,10 @@ function artifactsDir(sessionFile: string | undefined): string | undefined {
 function resetCostCacheForSession(sessionFile: string | undefined): void {
 	if (sessionFile === costSessionFile) return;
 	costSessionFile = sessionFile;
+	costGeneration++;
 	subagentCostCache.clear();
 	subagentCostSettled.clear();
+	subagentCostAttempts.clear();
 }
 
 /** Total resolved subagent spend. Read synchronously to build the HUD. */
@@ -685,6 +713,9 @@ async function resolveRunCost(runId: string, metaPaths: string[]): Promise<numbe
 	if (subagentCostCache.has(runId)) return subagentCostCache.get(runId) ?? 0;
 	if (subagentCostSettled.has(runId)) return 0;
 
+	// The session can switch while these reads are in flight, in which case the
+	// result belongs to a session that is no longer on screen.
+	const generation = costGeneration;
 	let total = 0;
 	let foundAny = false;
 	let dirExists = true;
@@ -715,14 +746,17 @@ async function resolveRunCost(runId: string, metaPaths: string[]): Promise<numbe
 		}
 	}
 
+	if (generation !== costGeneration) return 0; // session moved on; drop it
+
+	const attempts = (subagentCostAttempts.get(runId) ?? 0) + 1;
+	subagentCostAttempts.set(runId, attempts);
 	if (foundAny) {
 		subagentCostCache.set(runId, total);
 		subagentCostSettled.add(runId);
-	} else if (!dirExists && metaPaths.length === 0) {
-		subagentCostSettled.add(runId); // nothing to find; stop retrying
+	} else if ((!dirExists && metaPaths.length === 0) || attempts >= SUBAGENT_COST_MAX_ATTEMPTS) {
+		subagentCostSettled.add(runId); // nothing to find, or it is never arriving
 	}
-	// Otherwise the dir exists but this run's artifact is not written yet (an
-	// async run still in flight), so leave it unsettled for a later retry.
+	// Otherwise leave it unsettled: an async run may still be writing its artifact.
 	return subagentCostCache.get(runId) ?? total;
 }
 
@@ -767,11 +801,14 @@ function loadSubagentCosts(entries: readonly unknown[], onDone: () => void): voi
 	const runMetas = collectSubagentRuns(entries);
 	const pending = [...runMetas.keys()].filter((id) => !subagentCostSettled.has(id) && !subagentCostCache.has(id));
 	if (pending.length === 0) return;
+	const generation = costGeneration;
 	subagentLoad = (async () => {
 		for (const id of pending) await resolveRunCost(id, runMetas.get(id) ?? []);
 	})().finally(() => {
 		subagentLoad = undefined;
-		onDone();
+		// A session switch while this was running makes the redraw pointless: the
+		// new session already rendered its own totals.
+		if (generation === costGeneration) onDone();
 	});
 }
 
@@ -789,9 +826,11 @@ const anim = {
 	browEnteredAt: 0, // when the brow entered its current position (for the hold timer)
 	health: 100,
 	enabled: true,
-	// Real pixel face where the terminal supports inline images. DOOM_HUD_IMAGE=0
-	// forces the quadrant-block face.
-	imageFace: process.env.DOOM_HUD_IMAGE !== "0",
+	// Prefer the pixel face. When the terminal has no image protocol, renderHudBar
+	// automatically uses the quadrant-block fallback; /doomhud text forces it.
+	imageFace: true,
+	healthOverride: null as number | null,
+	overrideContextTokens: null as number | null,
 	focusUntil: 0, focusName: "",
 	compacting: false,
 	timer: null as ReturnType<typeof setInterval> | null,
@@ -840,13 +879,13 @@ function stepBrow(): void {
 }
 
 /** Pick the frame name for the current animation state. */
-function currentFaceName(frames: Map<string, Frame>): string {
+function currentFaceName(): string {
 	if (anim.compacting) return "dead";
 	// No "fresh" face any more. A context at 0% is simply full health, so it
 	// shows the healthiest tier and animates like any other. The band index is
 	// clamped so a full context (health 0) shows the most damaged tier rather
 	// than falling off the end of the list.
-	const band = Math.min(anim.bandIndex, BANDS.length - 1);
+	const band = Math.min(anim.bandIndex, BAND_COUNT - 1);
 	if (Date.now() < anim.focusUntil && anim.focusName) return anim.focusName;
 	const kind = anim.browPos === 0 ? "left" : anim.browPos === 2 ? "right" : "neutral";
 	return `tier${band + 1}_${kind}`;
@@ -1117,7 +1156,10 @@ function renderBlockFace(face: Frame, cells: number, rows: number, cellRatio: nu
 	if (cached) return cached;
 
 	const srcW = face.width, srcH = face.height;
-	const ground: Col = [HUD.bg.r, HUD.bg.g, HUD.bg.b];
+	// The face sits in its own steel panel, so transparent pixels take the panel
+	// colour, exactly as the inline-image slices do. Using the bar gutter colour
+	// here would paint a dark rectangle around the head.
+	const ground: Col = [HUD.steel.r, HUD.steel.g, HUD.steel.b];
 	const R = (v: number) => Math.round(Math.max(0, Math.min(255, v)));
 	const fit = fitFace(face, cells * 2, rows * 2, cellRatio);
 
@@ -1238,43 +1280,50 @@ function faceSlicePng(face: Frame, row: number, rows: number, wpx: number, hpx: 
 	if (hit !== undefined) return hit;
 
 	const srcW = face.width, srcH = face.height;
-	const bandTop = (row * srcH) / rows;
-	const bandH = Math.max(1e-6, srcH / rows);
 	const steel: Col = [HUD.steel.r, HUD.steel.g, HUD.steel.b];
 	const rgba = new Uint8Array(wpx * hpx * 4);
-	// Keep the head's own aspect: fit by height and centre horizontally, so a
-	// frame that is a few pixels narrower than the panel is letterboxed with the
-	// steel showing through rather than being stretched wider.
-	const panelAspect = wpx / (hpx * rows);
-	const srcAspect = srcH > 0 ? srcW / srcH : 0.8;
-	const drawW = srcAspect < panelAspect ? Math.max(1, Math.round(hpx * rows * srcAspect)) : wpx;
+	// Keep the head's own aspect. The slice stack is one image, `rows` cells tall,
+	// so the fit is computed once for the whole stack (not per row, which would
+	// letterbox each row on its own and slice the head into bands) and the
+	// remaining space is filled with steel. Fitting by a single scale on both
+	// axes matters: whatever the terminal's cell shape, the head is never
+	// stretched, it just gets more or less steel around it.
+	const totalH = hpx * rows;
+	const scale = Math.min(wpx / Math.max(1, srcW), totalH / Math.max(1, srcH));
+	const drawW = Math.max(1, Math.round(srcW * scale));
+	const drawH = Math.max(1, Math.round(srcH * scale));
+	const xOff = Math.floor((wpx - drawW) / 2);
+	const yOff = Math.floor((totalH - drawH) / 2);
 	// Always interpolate. The source art is a soft render of the original
 	// low-res sprites, so its eyebrow and pupil detail lives in the grey
 	// transitions, not in hard edges. Nearest-sampling on the way up turns
 	// those transitions into hard blocks, which reads as the eyebrows and
 	// pupils going solid black. Smooth sampling is what keeps them shaped.
-	const xOff = Math.floor((wpx - drawW) / 2);
 	const clampX = (v: number) => (v < 0 ? 0 : v >= srcW ? srcW - 1 : v);
 	const clampY = (v: number) => (v < 0 ? 0 : v >= srcH ? srcH - 1 : v);
 	const px = face.fbPx, pa = face.fbA;
 	for (let y = 0; y < hpx; y++) {
-		const sy = bandTop + ((y + 0.5) * bandH) / hpx - 0.5;
+		const o0 = y * wpx * 4;
+		// This row's scanlines in the coordinate space of the whole face.
+		const gy = row * hpx + y + 0.5;
+		const inDrawY = gy >= yOff && gy < yOff + drawH;
+		const sy = (gy - yOff) / scale - 0.5;
 		const iyFloor = Math.floor(sy);
 		const iy1 = clampY(iyFloor + 1);
 		const fy = sy - iyFloor;
 		const iy0 = clampY(iyFloor), gy0 = 1 - fy;
 		const row0 = iy0 * srcW, row1 = iy1 * srcW;
 		for (let x = 0; x < wpx; x++) {
-			const o = (y * wpx + x) * 4;
-			if (x < xOff || x >= xOff + drawW) {
+			const o = o0 + x * 4;
+			if (!inDrawY || x < xOff || x >= xOff + drawW) {
 				rgba[o] = steel[0]!; rgba[o + 1] = steel[1]!; rgba[o + 2] = steel[2]!; rgba[o + 3] = 255;
 				continue;
 			}
-		const sx = ((x - xOff + 0.5) * srcW) / drawW - 0.5;
-		const ixFloor = Math.floor(sx);
-		const ix1 = clampX(ixFloor + 1);
-		const fx = sx - ixFloor;
-		const ix0 = clampX(ixFloor), gx0 = 1 - fx;
+			const sx = (x - xOff + 0.5) / scale - 0.5;
+			const ixFloor = Math.floor(sx);
+			const ix1 = clampX(ixFloor + 1);
+			const fx = sx - ixFloor;
+			const ix0 = clampX(ixFloor), gx0 = 1 - fx;
 			const w00 = gx0 * gy0, w10 = fx * gy0, w01 = gx0 * fy, w11 = fx * fy;
 			const p00 = row0 + ix0, p10 = row0 + ix1, p01 = row1 + ix0, p11 = row1 + ix1;
 			const a00 = (pa[p00] ?? 0) / 255, a10 = (pa[p10] ?? 0) / 255;
@@ -1331,6 +1380,44 @@ function faceSliceSequence(
 const STAT_PAD = 2;
 
 /**
+ * Narrowest terminal the bar stays up in. pi-tui throws when a rendered line is
+ * wider than the terminal, so the bar has to fit exactly; below this the panels
+ * cannot hold their figures and the bar stands down instead of throwing.
+ */
+const MIN_HUD_WIDTH = 60;
+/** Narrowest a tile is ever squeezed to before the grid simply clips. */
+const MIN_PANEL_W = 7;
+/** MODEL needs this much to read as a name rather than a smear. */
+const MODEL_FLOOR = 12;
+/** Width the stats tile wants when the terminal has room for it. */
+const LIST_WANT = 36;
+
+/**
+ * Force every string the bar draws into single-column characters. The grid is
+ * addressed by character, so a wide glyph (CJK, emoji) would occupy one grid
+ * cell while taking two terminal columns, pushing the rest of the row out and
+ * making the line wider than the terminal. Anything not one column wide becomes
+ * "?", which keeps the layout exact for any model id, path, or branch name.
+ */
+function cells(s: string): string {
+	let out = "";
+	for (const ch of s) out += visibleWidth(ch) === 1 ? ch : "?";
+	return out;
+}
+
+function sanitizeHud(hud: HudData): HudData {
+	return {
+		...hud,
+		stats: hud.stats.map((s) => ({ label: cells(s.label), value: cells(s.value) })),
+		modelId: cells(hud.modelId),
+		thinking: cells(hud.thinking),
+		provider: cells(hud.provider),
+		branch: cells(hud.branch),
+		dir: cells(hud.dir),
+	};
+}
+
+/**
  * Panel texture. `false` gives flat panels. On, it lays a sparse speckle of the
  * alt steel shade over the fill, roughly one cell in six, which reads as grime
  * on the metal. Kept as one switch so the look can be dropped in one edit.
@@ -1341,7 +1428,7 @@ const PANEL_TEXTURE = true;
  * Render the full status bar to ANSI lines. Pure: (frames, hud, imageFace,
  * width, faceName) -> lines, so it can be driven straight from the preview tool.
  * The bar spans the full `width`, in the classic Doom status-bar order: TOKENS,
- * CONTEXT, STATUS, FACE, COST, then the AMMO LIST on the right. Height is fixed,
+ * CONTEXT, MODEL, FACE, COST, then the stats tile on the right. Height is fixed,
  * and `imageFace` picks the real pixel face over the block-glyph fallback.
  */
 export function renderHudBar(
@@ -1351,10 +1438,13 @@ export function renderHudBar(
 	width: number,
 	faceName: string,
 ): string[] {
-	const d = hud;
+	const d = sanitizeHud(hud);
 	const H = HUD_ROWS;
 	const GAP = 1;
-	if (width < 60) width = 60; // minimum usable width
+	// pi-tui *throws* (and stops the TUI) if any line is wider than the terminal,
+	// so a bar that cannot fit its panels must stand down rather than spill. Below
+	// the floor the panels would be squeezed to nothing anyway.
+	if (width < MIN_HUD_WIDTH) return [];
 	// The value block is 5 rows of bitmap digits with a 1-row label under it.
 	// Centre that 7-row block in the band so the panels do not look top-anchored.
 	// Row `lblRow + 1` is still inside the panel (inner rows are 2..10), and is
@@ -1374,63 +1464,82 @@ export function renderHudBar(
 		faceW = Math.max(8, Math.round(faceRows * 2 * cropAspect));
 	}
 	const W_FACE = faceW + 2;
-	// Panel widths. Each tile states the width it needs for its own content, so a
-	// narrow terminal takes the shortfall from the tiles that can spare it rather
-	// than clipping the big numbers. Surplus is shared by weight, and the stats
-	// tile is deliberately given none: its rows are a short label and a short
-	// number, so extra width there is just a wider gap.
-	const rest = Math.max(40, width - W_FACE - GAP * 5);
-	const moneySymW = glyphRows("$")[0]!.length;
-	// The stats tile gets a generous base: it carries a label column, a value
-	// column and a cwd plus branch caption, and branch names run long. It is still
-	// the first tile to give ground when the terminal narrows, and it takes a
-	// share of surplus so wide terminals give it even more room.
-	const needList = 36;
-	const needs = [
-		bitmapWidth(fmtNum(d.window)) + 2,                        // TOKENS
-		bitmapWidth("100%") + 2,                                  // CONTEXT
-		14,                                                       // MODEL
-		moneySymW + GLYPH_GAP + bitmapWidth(d.cost.toFixed(3)) + 2, // COST
-		needList,                                                 // LIST
+	// Panel widths. Every tile states two widths: a *floor*, the point below which
+	// it cannot show the figure it exists for, and a *want*, the width at which it
+	// looks right. Floors are met first and whatever is left is shared out by how
+	// much more each tile wanted, so a narrow terminal squeezes the tiles in
+	// proportion to their own content instead of starving one of them.
+	const rest = Math.max(0, width - W_FACE - GAP * 5);
+	const moneySymW = glyphRows("$")[0]!.length;	const statRows = d.stats.slice(0, 4);
+	const valueW = Math.max(1, ...statRows.map((r) => r.value.length));
+	const maxLabel = Math.max(1, ...statRows.map((r) => r.label.length));
+	const floors = [
+		bitmapWidth(fmtNum(d.window)),                            // TOKENS: its figure
+		bitmapWidth("100%"),                                      // CONTEXT: its figure
+		MODEL_FLOOR,                                              // MODEL: a readable stub
+		moneySymW + GLYPH_GAP + bitmapWidth(d.cost.toFixed(3)),   // COST: its figure
+		STAT_PAD * 2 + maxLabel + 1 + valueW,                     // LIST: label + value column
 	];
-	// Surplus leans to the stats tile and away from TOKENS and COST, which have all
-	// the room their centred figures need once they clear their base width.
-	const surplusWeights = [0.175, 0.21, 0.19, 0.175, 0.25];
-	const LIST_FLOOR = 14;
-	const MODEL_FLOOR = 12;
-	let w5 = needs.slice();
-	const needSum = needs.reduce((a, b) => a + b, 0);
-	if (rest >= needSum) {
-		const surplus = rest - needSum;
-		w5 = needs.map((n, i) => n + Math.floor(surplus * surplusWeights[i]!));
-	} else {
-		// Short of room. The stats tile gives ground first, then MODEL, and only
-		// then does everything shrink together.
-		let short = needSum - rest;
-		const giveGround = (i: number, floor: number) => {
-			const take = Math.min(short, Math.max(0, w5[i]! - floor));
-			w5[i]! -= take;
-			short -= take;
-		};
-		giveGround(4, LIST_FLOOR);
-		giveGround(2, MODEL_FLOOR);
-		if (short > 0) {
-			const sum = w5.reduce((a, b) => a + b, 0);
-			w5 = w5.map((v) => Math.max(7, Math.floor(v * (rest / sum))));
+	const wants = [
+		floors[0]! + 2,
+		floors[1]! + 2,
+		MODEL_FLOOR + 2,
+		floors[3]! + 2,
+		// The stats tile also carries the cwd and branch caption, and branch names
+		// run long, so it wants a generous width.
+		Math.max(floors[4]!, LIST_WANT),
+	];
+	// The stats tile is the one tile that is dropped rather than squeezed. Below its
+	// floor its four values are unreadable anyway (a single visible character per
+	// row), and those columns are far better spent on the headline figures. Dropping
+	// it also frees a gutter, so the budget is recomputed for the tiles that remain.
+	const showList = rest >= floors[0]! + floors[1]! + floors[2]! + floors[3]! + floors[4]!;
+	const keep = showList ? [0, 1, 2, 3, 4] : [0, 1, 2, 3];
+	// Elements are the kept tiles plus the face, so there is one gutter between each
+	// pair: `keep.length` gutters in total.
+	const budget = Math.max(0, width - W_FACE - GAP * keep.length);
+	const floorSum = keep.reduce((a, i) => a + floors[i]!, 0);
+	const wantSum = keep.reduce((a, i) => a + wants[i]!, 0);
+	const w5 = [0, 0, 0, 0, 0];
+	if (budget >= wantSum) {
+		const surplus = budget - wantSum;
+		// Surplus leans to the stats tile and away from TOKENS and COST, which have
+		// all the room their centred figures need once they clear their base width.
+		const surplusWeights = [0.175, 0.21, 0.19, 0.175, 0.25];
+		for (const i of keep) w5[i] = wants[i]! + Math.floor(surplus * surplusWeights[i]!);
+	} else if (budget >= floorSum) {
+		const slackSum = keep.reduce((a, i) => a + (wants[i]! - floors[i]!), 0);
+		const leftover = budget - floorSum;
+		for (const i of keep) {
+			const slack = wants[i]! - floors[i]!;
+			w5[i] = floors[i]! + (slackSum > 0 ? Math.floor((leftover * slack) / slackSum) : 0);
 		}
+	} else {
+		// Narrower than every floor together: squeeze proportionally, and let the
+		// trim loop below take any excess out of the widest tiles.
+		for (const i of keep) w5[i] = Math.max(MIN_PANEL_W, Math.floor((floors[i]! * budget) / Math.max(1, floorSum)));
+	}
+	let used = keep.reduce((a, i) => a + w5[i]!, 0);
+	while (used > budget) {
+		let widest = -1;
+		for (const i of keep) if (w5[i]! > MIN_PANEL_W && (widest < 0 || w5[i]! > w5[widest]!)) widest = i;
+		if (widest < 0) break; // every tile is at the minimum; the grid clips instead
+		w5[widest]!--;
+		used--;
 	}
 	// Rounding leftovers go to the COST tile, so the bar still spans the full
 	// width and the slack lands somewhere useful rather than on the stats tile.
-	w5[3]! += rest - w5.reduce((a, b) => a + b, 0);
+	if (budget >= used) w5[3]! += budget - used;
 	const [W_AMMO, W_HEALTH, W_ARMS, W_ARMOR, W_LIST] = w5;
 
 	// Panel widths, indexed by identity so the drawing code below can keep
-	// addressing them by name: 0 AMMO, 1 HEALTH, 2 ARMS, 3 ARMOR, 4 AMMO LIST,
+	// addressing them by name: 0 TOKENS, 1 CONTEXT, 2 MODEL, 3 COST, 4 stats,
 	// 5 FACE.
 	const panelW = [W_AMMO, W_HEALTH, W_ARMS, W_ARMOR, W_LIST, W_FACE];
 	// Physical left-to-right order, the classic Doom status bar: the face sits
-	// between the ARMS grid and ARMOR, with the ammo list off to the right.
-	const LAYOUT = [0, 1, 2, 5, 3, 4];
+	// between the ARMS grid and ARMOR, with the ammo list off to the right. The
+	// stats tile drops off the end when the terminal cannot hold it.
+	const LAYOUT = showList ? [0, 1, 2, 5, 3, 4] : [0, 1, 2, 5, 3];
 	const xs: number[] = new Array(6).fill(0);
 	let x = 0;
 	for (let k = 0; k < LAYOUT.length; k++) {
@@ -1584,18 +1693,10 @@ export function renderHudBar(
 			// Match roughly one image pixel per device pixel, but cap it: these slices
 			// are re-sent whenever the row changes, and a face row is only ever about
 			// 20 device pixels tall, so more resolution is wasted bytes.
-		// High-res slices. iTerm2 draws inline images at the display's pixel ratio,
-		// so a slice encoded at the point size gets upscaled and blurred, which
-		// smears the eye whites (the sprite has near-black pupils sitting right
-		// against bright whites, and blur drags dark into the white). Floor the
-		// cell size at 2x the 9x18 default so the terminal never has to upscale.
 		// Encode at the size the slice is actually drawn at. The face art is
-		// already about the size of the draw box (a 170px head in an 18 cell
-		// wide slot), so encoding at 2x only forces the terminal to downscale
-		// every slice back again, and that round trip is what hardens the eye
-		// detail. Set DOOM_HUD_SLICE_SCALE=2 on a 2x display if the terminal
-		// ends up upscaling and smearing instead.
-		const sliceScale = process.env.DOOM_HUD_SLICE_SCALE === "2" ? 2 : 1;
+		// already about the size of the draw box, so keeping the source at the
+		// measured cell size avoids an unnecessary upscale/downscale round trip.
+		const sliceScale = 1;
 		const cellW = cellDim.widthPx * sliceScale;
 		const cellH = cellDim.heightPx * sliceScale;
 		const wpx = Math.max(32, Math.min(Math.round(faceW * cellW), 720));
@@ -1625,31 +1726,29 @@ export function renderHudBar(
 	// 6. Right tile: the session's token economics, one reading per row with the
 	// values right-aligned into a single column, plus the cwd and branch caption.
 	// Everything is inset a column from the bevel and the block starts a row down,
-	// so no content sits against the tile's border.
-	fillPanel(grid, xs[4]!, y0, W_LIST, H);
-	const listX = xs[4]!;
-	const statRows = d.stats.slice(0, 4);
-	const valueW = Math.max(1, ...statRows.map((r) => r.value.length));
-	const maxLabel = Math.max(1, ...statRows.map((r) => r.label.length));
-	// Left-aligned label, right-aligned value, or the value pushed right if the
-	// label needs the room first.
-	const valueX = listX + Math.max(STAT_PAD + maxLabel + 1, W_LIST - 1 - STAT_PAD - valueW);
-	for (let i = 0; i < statRows.length; i++) {
-		const row = statRows[i]!;
-		// Rows 2, 4, 6, 8: the block brackets the other tiles' figure rows (3-7)
-		// with a blank row above it, and the caption then lands on the title row.
-		const sy = 2 + i * 2;
-		if (!grid[sy]) continue;
-		// The label column stops at the value block, so a long label can never
-		// run into the numbers.
-		putText(grid, listX + STAT_PAD, sy, row.label, HUD.white, valueX - 1);
-		putText(grid, valueX, sy, row.value, HUD.gold);
-		boldRange(valueX, sy, row.value.length);
-	}
-	// Caption: cwd basename (bold) then the git branch in brackets, drawn in two
-	// colours so the branch reads as the part that changes. If both will not fit,
-	// keep the directory and drop the branch rather than clipping it in half.
-	{
+	// so no content sits against the tile's border. Skipped entirely when the
+	// terminal was too narrow for it (see the panel width allocation above).
+	if (showList) {
+		fillPanel(grid, xs[4]!, y0, W_LIST, H);
+		const listX = xs[4]!;
+		// Left-aligned label, right-aligned value, or the value pushed right if the
+		// label needs the room first.
+		const valueX = listX + Math.max(STAT_PAD + maxLabel + 1, W_LIST - 1 - STAT_PAD - valueW);
+		for (let i = 0; i < statRows.length; i++) {
+			const row = statRows[i]!;
+			// Rows 2, 4, 6, 8: the block brackets the other tiles' figure rows (3-7)
+			// with a blank row above it, and the caption then lands on the title row.
+			const sy = 2 + i * 2;
+			if (!grid[sy]) continue;
+			// The label column stops at the value block, so a long label can never
+			// run into the numbers.
+			putText(grid, listX + STAT_PAD, sy, row.label, HUD.white, valueX - 1);
+			putText(grid, valueX, sy, row.value, HUD.gold);
+			boldRange(valueX, sy, row.value.length);
+		}
+		// Caption: cwd basename (bold) then the git branch in brackets, drawn in two
+		// colours so the branch reads as the part that changes. If both will not fit,
+		// keep the directory and drop the branch rather than clipping it in half.
 		const innerList = Math.max(1, W_LIST - 3);
 		let dirTxt = d.dir;
 		let brTxt = d.branch ? `[${d.branch}]` : "";
@@ -1706,19 +1805,47 @@ class DoomHudComponent implements Component {
 		this.frames = frames;
 	}
 
-	/** Update the live stats; the next render picks them up. */
-	setHudData(d: HudData) {
-		this.hud = d;
-		const health = Math.max(0, Math.min(100, Math.round(d.health)));
+	private setFaceHealth(value: number): void {
+		const health = Math.max(0, Math.min(100, Math.round(value)));
 		if (health !== anim.health) {
 			const newBand = bandFor(100 - health);
 			if (newBand !== anim.bandIndex) {
 				anim.bandIndex = newBand;
 				anim.browPos = 1; anim.browDir = 1; anim.browEnteredAt = Date.now();
-				if (newBand >= BANDS.length) anim.focusUntil = 0;
+				// Any band change retires the focus face: a tier1 glare must not stay
+				// on screen after the health has dropped to a worse tier.
+				anim.focusUntil = 0; anim.focusName = "";
 			}
 			anim.health = health;
 		}
+	}
+
+	/** Update the live stats; the next render picks them up. */
+	setHudData(d: HudData) {
+		this.hud = d;
+		// A test override lasts until the actual context token count changes.
+		// That makes `/doomhud 25` useful for inspecting a face without being
+		// immediately overwritten by the refresh timer.
+		if (anim.healthOverride !== null && anim.overrideContextTokens !== d.contextTokens) {
+			anim.healthOverride = null;
+			anim.overrideContextTokens = null;
+		}
+		this.setFaceHealth(anim.healthOverride ?? d.health);
+		this.tui.requestRender();
+	}
+
+	setHealthOverride(health: number) {
+		if (!this.hud) return;
+		anim.healthOverride = health;
+		anim.overrideContextTokens = this.hud.contextTokens;
+		this.setFaceHealth(health);
+		this.tui.requestRender();
+	}
+
+	clearHealthOverride() {
+		anim.healthOverride = null;
+		anim.overrideContextTokens = null;
+		if (this.hud) this.setFaceHealth(this.hud.health);
 		this.tui.requestRender();
 	}
 
@@ -1733,7 +1860,6 @@ class DoomHudComponent implements Component {
 
 	start() {
 		if (anim.timer) return;
-		const tui = this.tui;
 		anim.timer = setInterval(() => {
 			const now = Date.now();
 			// Nothing to animate while the bar is hidden behind an overlay, and
@@ -1744,7 +1870,7 @@ class DoomHudComponent implements Component {
 				anim.browEnteredAt = now;
 				// Once in a while the brow holds a dedicated "focus" frame for a
 				// few seconds, like the Doom guy glaring at you.
-				if (now >= anim.focusUntil && anim.bandIndex < BANDS.length) {
+				if (now >= anim.focusUntil && anim.bandIndex < BAND_COUNT) {
 					if (Math.random() < FOCUS_CHANCE) {
 						anim.focusUntil = now + FOCUS_MIN_MS + Math.random() * (FOCUS_MAX_MS - FOCUS_MIN_MS);
 						const ff = `tier${anim.bandIndex + 1}_focus`;
@@ -1753,7 +1879,9 @@ class DoomHudComponent implements Component {
 				}
 				stepBrow();
 			}
-			tui.requestRender();
+			// this.tui, not the captured one: pi can hand the widget factory a new
+			// TUI (theme change, reload), and the old instance must not be painted.
+			this.tui.requestRender();
 		}, 40);
 		anim.timer.unref?.();
 	}
@@ -1763,6 +1891,7 @@ class DoomHudComponent implements Component {
 	static stop() { if (anim.timer) clearInterval(anim.timer); anim.timer = null; }
 	static resetTransient() {
 		anim.bandIndex = 0; anim.browPos = 1; anim.browDir = 1; anim.browEnteredAt = 0; anim.health = 100;
+		anim.healthOverride = null; anim.overrideContextTokens = null;
 		anim.focusUntil = 0; anim.focusName = "";
 		anim.compacting = false;
 	}
@@ -1778,7 +1907,7 @@ class DoomHudComponent implements Component {
 		// until the overlay closes. The memo cache is deliberately left intact,
 		// so the bar comes straight back afterwards without a rebuild.
 		if (this.tui.hasOverlay()) return [];
-		const faceName = currentFaceName(this.frames);
+		const faceName = currentFaceName();
 		const cell = getCellDimensions();
 		const key = `${width}|${anim.imageFace ? 1 : 0}|${cell.widthPx}x${cell.heightPx}|${faceName}|${JSON.stringify(this.hud)}`;
 		if (key === this.cacheKey) return this.cacheLines;
@@ -1837,7 +1966,11 @@ export default async function (pi: ExtensionAPI) {
 	// never existed, so the dead face never showed.
 	pi.on("session_before_compact", (_e, c) => { ctxRef = c; active?.setCompacting(true); });
 	pi.on("session_compact", (_e, c) => { ctxRef = c; active?.setCompacting(false); refresh(); });
-	pi.on("session_compact_failed", (_e, c) => { ctxRef = c; active?.setCompacting(false); refresh(); });
+	// session_compact_failed was added after the first 0.84 releases. Register it
+	// by name so older Pi versions still typecheck and fall back to turn_end for
+	// clearing the dead face, while newer versions clear it immediately.
+	(pi as { on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => void) => void }).on(
+		"session_compact_failed", (_e, c) => { ctxRef = c; active?.setCompacting(false); refresh(); });
 
 	pi.on("message_update", (_e, c) => { ctxRef = c; refresh(); });
 	pi.on("message_end", (_e, c) => { ctxRef = c; refresh(); });
@@ -1858,11 +1991,24 @@ export default async function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("doomhud", {
-		description: "Toggle the Doom HUD. /doomhud image|text.",
+		description: "Toggle the Doom HUD. /doomhud image|text|natural|0-100.",
 		handler: async (args, ctx) => {
 			const a = (args ?? "").trim().toLowerCase();
-			const caps = getCapabilities();
-			if (a === "image") {
+			const numericArg = /^[-+]?\d+$/.test(a) ? Number(a) : null;
+			if (numericArg !== null) {
+				if (!Number.isInteger(numericArg) || numericArg < 0 || numericArg > 100) {
+					ctx.ui.notify("Doom HUD: test health must be an integer from 0 to 100", "warning");
+				} else if (!active) {
+					ctx.ui.notify("Doom HUD: start a TUI session before setting test health", "warning");
+				} else {
+					active.setHealthOverride(numericArg);
+					ctx.ui.notify(`Doom HUD: test health ${numericArg}% until context changes`, "info");
+				}
+			} else if (a === "natural") {
+				active?.clearHealthOverride();
+				ctx.ui.notify("Doom HUD: natural context health", "info");
+			} else if (a === "image") {
+				const caps = getCapabilities();
 				if (!caps.images) {
 					ctx.ui.notify("Doom HUD: this terminal has no inline-image support", "warning");
 				} else {

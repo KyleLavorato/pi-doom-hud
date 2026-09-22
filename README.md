@@ -1,10 +1,8 @@
 # Pi Doom HUD
 
-A Doom-style status bar for the [Pi coding agent](https://github.com/badlogic/pi-mono/): beveled steel panels, red bitmap digits, and an animated Doom Guy face that degrades as your context window fills up.
+Doom-style status bar for the [Pi Coding Agent](pi.dev). It features Doom Guy who's face gets more damaged as the context window fills up. The status bar also includes useful stats driven from live session usage.
 
-![Pi Doom HUD at 45% context](docs/hud-tier3.png)
-
-The bar is a single widget rendered directly below the prompt box. Every reading on it comes from the live session: context usage, the model's context window, session cost, token economics, and subagent spend. The face in the middle is the classic Doom health-face sprite sheet, cropped, keyed, and re-rendered per frame.
+![Pi Doom HUD at full health](docs/hud-tier1.png)
 
 ## Install
 
@@ -12,87 +10,66 @@ The bar is a single widget rendered directly below the prompt box. Every reading
 pi install npm:pi-doom-hud
 ```
 
-Restart Pi after installation. The HUD starts on by default.
+Restart or reload Pi. The HUD prefers the high-resolution image face by default when Pi reports image support. If it is unavailable, blurry, or leaves stale images, run `/doomhud text` to switch to the reliable quadrant-block fallback at lower resolution.
 
-## What the panels show
+## Panels
 
-```
-[ TOKENS 200k ] [ CONTEXT 45% ] [ MODEL claude-opus-4-5 ] [ FACE ] [ COST $1.694 ] [ CACHE  98% ]
-                                                                                [ IN   18.4k ]
-                                                                                [ OUT   534 ]
-                                                                                [ BLENDED $1.203 ]
-```
+| Panel | Shows |
+|-------|-------|
+| TOKENS | The model's context window, the capacity CONTEXT is measured against. |
+| CONTEXT | Context usage as a percentage of the window. Green below 70%, amber at 70%, red at 90%+. |
+| MODEL | The model id with the thinking level underneath and the provider as a caption. |
+| FACE | The Doom Guy. Health is `100 - context usage`, mapped onto the five classic health tiers. |
+| COST | Session spend in USD to three decimals, including compaction, branch-summary, and subagent spend. |
+| CACHE / IN / OUT / BLENDED | Prompt-cache hit rate, fresh input tokens, output tokens, and mean spend per million billed tokens for in-session calls. Includes the current directory and git branch as a title. |
 
-| Panel | Meaning |
-|-------|---------|
-| TOKENS | The model's context window in tokens. This is the capacity the CONTEXT percentage is measured against. |
-| CONTEXT | Context usage as a percentage of the window. Green below 70%, amber at 70%, red at 90% and up, dim when there is no reading (right after a compaction, before the next response). |
-| MODEL | The model id, broken on `-` onto as many lines as the panel needs, with the thinking level underneath and the provider as a caption. |
-| FACE | The Doom Guy. Health is `100 - context usage`, mapped onto the five classic health tiers. He glances left and right on a random walk, glares occasionally, and shows the dead face while a compaction is running. |
-| COST | Session spend in USD to three decimals. Includes assistant and tool-result usage, compaction and branch-summary calls, and subagent spend resolved from [pi-subagents](https://www.npmjs.com/package/pi-subagents) artifacts, so it matches Pi's own footer. |
-| CACHE | Prompt-cache hit rate: the share of the prompt served from cache. |
-| IN / OUT | Fresh input tokens and output tokens for the session. |
-| BLENDED | Total spend divided by every billed token, in dollars per million tokens. This sits far below sticker prices because cache reads typically cost a twentieth of input. |
+The tiles have their own size constraints so in smaller terminals, the tile with the most extra space will begin to compact first. This ensures as much data as possible is always visible.
 
-The bottom caption on the last tile shows the current directory and git branch. The branch is re-checked every 30 seconds, so switching branches shows up without a restart.
+## Doom Guy
 
-## The face
+The Doom Guy face is rendered as an image using the Kitty graphics protocol. In order to be displayed, it this protocol must be supported in your terminal and environment. When not available there is a block art style face that can be used, at a much lower resolution.
 
-| | |
-|---|---|
-| ![Healthy](docs/hud-tier1.png) | ![Critical](docs/hud-tier5.png) |
-| `tier1`, 12% context | `tier5`, 95% context |
+The following terminals are known to support the Kitty image protocol:
+* Kitty
+* iTerm2
+* Ghostty
+* WezTerm
+* Warp
 
-There is no separate "fresh" face. An empty context is full health, so a new session shows the healthiest tier and animates like any other healthy session.
-
-### Pixel face vs block face
-
-On terminals with inline-image support the face is the real sprite, one single-row image per bar row. That one-image-per-row trick is what makes it work: pi-tui repaints the bar line by line, and a face spanning 13 rows would get striped and clipped as digit panels sharing its rows are erased. A one-cell-tall image is just a normal line to pi-tui, so repainting a row redraws that row's slice and nothing can carve holes in the face.
-
-| Terminal | Face rendering |
-|----------|----------------|
-| Kitty, Ghostty | Pixel face (Kitty graphics protocol) |
-| iTerm2 | Pixel face (iTerm2 inline images) |
-| WezTerm | Pixel face (iTerm2 escape) |
-| Everything else | Quadrant-block fallback |
-
-The fallback renders each character cell as a 2x2 subpixel grid using Unicode quadrant blocks rather than braille. Braille dots are tiny in fonts that substitute them, which washes the face out; quadrants exist in every terminal font and fill their subpixels solidly. 24-bit truecolor is required for the steel-and-red palette either way.
+The extension works everywhere. The quadrant-block face is the universal fallback and is covered
+by automated rendering tests. When Pi reports an image-capable terminal, the HUD tries the
+high-resolution face first. If it does not load correctly, run `/doomhud text`. On some terminals there is the possibility of flickering of the image based on how the terminal renders images.
 
 ## Commands
 
-- `/doomhud` - toggle the HUD on and off
-- `/doomhud image` - force the pixel face (warns if the terminal has no inline-image support)
-- `/doomhud text` - force the quadrant-block face
-
-## Environment variables
-
-- `DOOM_HUD_IMAGE=0` - start with the block face instead of the pixel face
-- `DOOM_HUD_SLICE_SCALE=2` - encode face slices at 2x. On a 2x display, if the terminal upscales the slices and the eye detail smears, set this so the terminal downscales instead.
+- `/doomhud` — Toggle the HUD on and off
+- `/doomhud image` — Use the high-resolution image face
+- `/doomhud text` — Use the quadrant-block face
+- `/doomhud <0-100>` — Set Doom Guy's health; it affects only the face and clears when the context token count changes
+- `/doomhud natural` — Clear a test-health override immediately
 
 ## Compatibility
 
-- **Pi**: built against the extension API and tested with pi 0.84.x and 0.87.x. It uses `ctx.ui.setWidget` (belowEditor placement), `ctx.getContextUsage()`, session entries, the `session_before_compact` / `session_compact` / `session_compact_failed` events, and `pi.registerCommand`.
-- **[pi-subagents](https://www.npmjs.com/package/pi-subagents)**: optional. When installed, subagent spend is read from its session artifacts so COST includes children. Without it the HUD works fine and COST just covers this session.
-- **Terminals**: any modern terminal for the block face; Kitty-protocol or iTerm2 inline images for the pixel face. No inline images and no truecolor? You will get a degraded but working bar.
+- **Pi**: requires pi 0.84.1 or newer and Node 22.19+. 
+- **[pi-subagents](https://www.npmjs.com/package/pi-subagents)**: Optional. When installed, subagent spend is read from its session artifacts so COST includes children.
 
-## How cost is counted
+## How Cost is Evaluated
 
-Every assistant message's usage lands in the session entries, and the HUD sums `input`, `output`, `cacheRead`, and `cacheWrite` from each one, plus `cost.total`. Compaction and branch-summary calls are billed too, so they are counted. Subagent children run as separate pi processes, so their spend never appears in this session's entries; the HUD reads it from the `subagent-artifacts` directory pi-subagents writes next to the session file, cached per run and resolved asynchronously so the COST panel converges with Pi's footer a moment after the first paint.
+Cost usage is summed using Pi's stable usage fields (`input`, `output`, `cacheRead`, `cacheWrite`, and `cost.total`), plus usage entries, compaction calls, and branch-summary calls when those entries provide usage. Missing optional usage is treated as zero. The HUD does not depend on provider-specific pricing fields. Subagent children are separate pi processes whose spend never reaches this session's entries, so their cost is read from the `subagent-artifacts` directory pi-subagents writes next to the session file, cached per run and resolved asynchronously.
 
 ## Development
 
 ```bash
 npm install
 npm run typecheck
-npm run preview                                   # /tmp/hud_preview.ppm
+npm test                                          
+npm run preview                                  
 npx tsx scripts/preview.ts 140 tier5_left out.ppm 95
 ```
 
-`scripts/preview.ts` rasterizes the bar (block face) to a PPM so layout changes can be eyeballed without a terminal. Any image viewer that reads PPM works; convert with ImageMagick or `sips` if needed.
+## Known Limitations
 
-## Known limitations
-
-- The pixel face needs 24-bit truecolor plus inline images; block glyphs otherwise.
-- CONTEXT and COST read dim or zero right after startup or a compaction, until the next response lands. That is the data, not a bug.
+- The bar needs 60 columns. Below that it stands down rather than spill. The stats tile is also dropped below roughly 118 columns, since its four values would not fit.
+- CONTEXT and COST read dim or zero immediately after startup or a compaction, until the next response lands. That is the data, not a bug.
 - BLENDED is dominated by cache reads, so it is not comparable to sticker input/output prices.
-- Subagent cost converges asynchronously; it can trail the first paint by a second or two.
+- Subagent cost trails the first paint while artifacts are read.

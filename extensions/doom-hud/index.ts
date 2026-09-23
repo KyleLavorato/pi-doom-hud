@@ -1945,6 +1945,8 @@ export default async function (pi: ExtensionAPI) {
 		if (ctx.mode !== "tui") return;
 		ctxRef = ctx;
 		DoomHudComponent.resetTransient();
+		// Replace pi's built-in status footer; the HUD already presents its useful stats.
+		ctx.ui.setFooter(() => ({ render: () => [], invalidate() {} }));
 		ctx.ui.setWidget(
 			"doom-hud",
 			(tui, _theme) => {

@@ -10,7 +10,7 @@ Doom-style status bar for the [Pi Coding Agent](pi.dev). It features Doom Guy wh
 pi install npm:pi-doom-hud
 ```
 
-Restart or reload Pi. The HUD prefers the high-resolution image face by default when Pi reports image support. If it is unavailable, blurry, or leaves stale images, run `/doomhud text` to switch to the reliable quadrant-block fallback at lower resolution.
+Restart or reload Pi. The HUD prefers the high-resolution image face by default when Pi reports image support. If it is unavailable, blurry, or leaves stale images, run `/doomhud text` to switch to the truecolor half-block fallback.
 
 ## Panels
 
@@ -21,13 +21,13 @@ Restart or reload Pi. The HUD prefers the high-resolution image face by default 
 | MODEL | The model id with the thinking level underneath and the provider as a caption. |
 | FACE | The Doom Guy. Health is `100 - context usage`, mapped onto the five classic health tiers. |
 | COST | Session spend in USD to three decimals, including compaction, branch-summary, and subagent spend. |
-| CACHE / IN / OUT / BLENDED | Prompt-cache hit rate, fresh input tokens, output tokens, and mean spend per million billed tokens for in-session calls. Includes the current directory and git branch as a title. |
+| CACHE / CACHE READ / CACHE WRITE / IN / OUT / BLENDED | CACHE shows the latest request's cache-read count plus cache-write tokens from the last completed agent run; this is activity, not resident cache size. Usage records do not include a cache-entry expiry time. The other rows show session token counts and USD cost by bucket, plus spend per million billed tokens. Costs are rounded to three decimals and aligned in one column. Green per-turn deltas appear only when the stats tile has room. OTHER shows spend without matching token totals, such as subagent cost, which BLENDED excludes. |
 
 The tiles have their own size constraints so in smaller terminals, the tile with the most extra space will begin to compact first. This ensures as much data as possible is always visible.
 
 ## Doom Guy
 
-The Doom Guy face is rendered as an image using the Kitty graphics protocol. In order to be displayed, it this protocol must be supported in your terminal and environment. When not available there is a block art style face that can be used, at a much lower resolution.
+The Doom Guy face is rendered as an image using the Kitty graphics protocol. In order to be displayed, this protocol must be supported by your terminal and environment. When it is unavailable, the HUD uses a truecolor half-block face instead. Each terminal cell carries two vertically stacked colors, which gives the text fallback a clean, detailed look.
 
 The following terminals are known to support the Kitty image protocol:
 * Kitty
@@ -36,15 +36,13 @@ The following terminals are known to support the Kitty image protocol:
 * WezTerm
 * Warp
 
-The extension works everywhere. The quadrant-block face is the universal fallback and is covered
-by automated rendering tests. When Pi reports an image-capable terminal, the HUD tries the
-high-resolution face first. If it does not load correctly, run `/doomhud text`. On some terminals there is the possibility of flickering of the image based on how the terminal renders images.
+The extension works everywhere. The half-block face is the text fallback and is covered by automated rendering tests. When Pi reports an image-capable terminal, the HUD tries the high-resolution face first. If it does not load correctly, run `/doomhud text`. On some terminals there is the possibility of flickering of the image based on how the terminal renders images.
 
 ## Commands
 
 - `/doomhud` — Toggle the HUD on and off
 - `/doomhud image` — Use the high-resolution image face
-- `/doomhud text` — Use the quadrant-block face
+- `/doomhud text` — Use the half-block face
 - `/doomhud <0-100>` — Set Doom Guy's health; it affects only the face and clears when the context token count changes
 - `/doomhud natural` — Clear a test-health override immediately
 

@@ -1,5 +1,5 @@
 // Renders the HUD bar to a PPM so it can be eyeballed without a real terminal.
-// It always renders the quadrant-block face, because the pixel face is a bunch
+// It always renders the half-block text face, because the pixel face is a bunch
 // of terminal escape sequences and a PPM rasteriser cannot draw those.
 //
 // Usage: npx tsx scripts/preview.ts [width] [faceName] [outPath] [contextPct]
@@ -29,12 +29,14 @@ const frames = await loadFrames();
 const hud: HudData = {
 	health: 100 - (usagePct ?? 0), usagePct,
 	contextTokens: usagePct == null ? null : Math.round(200_000 * (usagePct / 100)),
-	window: 200_000, cost: 1.694,
+	window: 200_000, cost: 0.582,
 	stats: [
-		{ label: "CACHE", value: "98%" },
-		{ label: "IN", value: "18.4k" },
-		{ label: "OUT", value: "534" },
-		{ label: "BLENDED", value: "$1.203" },
+		{ label: "CACHE", value: " 326k"},
+		{ label: "CACHE READ", value: "37.2m $0.372" },
+		{ label: "CACHE WRITE", value: " 467k $0.058" },
+		{ label: "IN", value: " 264k $0.026" },
+		{ label: "OUT", value: " 251k $0.125" },
+		{ label: "BLENDED", value: "$0.015/M" },
 	],
 	modelId: "claude-opus-4-5", thinking: "high", provider: "anthropic",
 	branch: "main", dir: "my-project",
@@ -85,7 +87,7 @@ for (let y = 0; y < H; y++) {
 		}
 		const ch = t.c;
 		const code = ch.codePointAt(0) ?? 0;
-		// Quadrant/half-block glyphs: 2x2 subpixel mask, bit order TL, TR, BL, BR.
+		// Block glyphs are rasterized as a 2x2 subpixel mask, bit order TL, TR, BL, BR.
 		const MASK: Record<string, number> = {
 			" ": 0b0000, "\u2598": 0b0001, "\u259d": 0b0010, "\u2580": 0b0011,
 			"\u2596": 0b0100, "\u258c": 0b0101, "\u259e": 0b0110, "\u259b": 0b0111,

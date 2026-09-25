@@ -3,13 +3,13 @@
  * HUD, rendered directly below the prompt box.
  *
  * Layout (left → right), each a beveled steel panel:
- *   [TOKENS 1.0m] [CONTEXT 24%] [MODEL id[high]] [FACE] [COST $1.694] [CACHE/IN/OUT/BLENDED]
+ *   [TOKENS 1.0m] [CONTEXT 24%] [MODEL id[high]] [FACE] [COST $1.694] [CACHE/CACHE READ/CACHE WRITE/IN/OUT/BLENDED]
  *
  * The Doom Guy face (with its animated eyebrows) sits between the STATUS grid and
  * COST, the classic Doom status-bar position, and reuses the sprite frames +
  * animation. On a terminal with inline-image support
  * (iTerm2, Kitty, Ghostty, WezTerm) it is the real pixel image. Otherwise it
- * falls back to Unicode quadrant blocks, a solid 2x2 subpixel grid per cell.
+ * falls back to truecolor Unicode half blocks, two vertically stacked pixels per cell.
  *
  * The face is drawn as ONE IMAGE PER BAR ROW, not one image for the whole face,
  * and that detail is the whole trick:
@@ -30,14 +30,14 @@
  *     one-cell-tall image leaves the cursor on its own line, and it advances
  *     only horizontally, which the next line's \r\n discards anyway.
  *
- * The text fallback uses quadrant blocks, NOT braille. Braille needs a font with
- * the glyphs, and when the font lacks them the terminal substitutes Apple
- * Braille, whose dots are tiny and leave most of each cell empty. That reads as
- * a washed out, blocky mess, strictly worse than half-blocks. Quadrants exist
- * in every terminal font and fill their subpixels solidly.
+ * The text fallback uses the Unicode upper-half block (▀), with independent
+ * truecolor samples for the top and bottom half of each cell. This follows the
+ * same rendering approach as pi-doom and gives each terminal column its own
+ * horizontal sample, while keeping each rendered pixel close to square. It also
+ * avoids braille's font-dependent, sparse dot patterns.
  *
  * The pixel face is the default where Pi reports image support. Use /doomhud text
- * to switch to the quadrant-block fallback, or /doomhud image to retry the pixel face.
+ * to switch to the half-block fallback, or /doomhud image to retry the pixel face.
  *
  *   faces/ holds the exact Doom health faces:
  *     tier1..tier5  ×  left / neutral / right / focus
@@ -55,13 +55,11 @@
  *             Includes assistant + toolResult usage, compaction and
  *             branch-summary calls, and subagent spend resolved from the
  *             pi-subagents artifacts, so it matches pi's own footer
- *   right tile rows: the session's token economics, recomputed as it runs
- *     CACHE   = prompt-cache hit rate, i.e. the share of prompt served from cache
- *     IN      = fresh input tokens
- *     OUT     = output tokens
- *     BLENDED = total spend / every billed token, three decimals. Note this is
- *               dominated by cache reads (typically a twentieth of the input
- *               price), so it sits far below the sticker input/output prices
+ *   right tile rows: session-wide token economics, recomputed as the session runs
+ *     CACHE   = latest cache-read count plus the last-turn cache-write delta;
+ *               this is activity, not the provider's resident cache size.
+ *     CACHE READ / CACHE WRITE / IN / OUT = token count plus spend for each bucket
+ *     BLENDED = usage cost per million billed tokens; OTHER shows unbucketed spend.
  *
  * Context colours follow pi's footer thresholds: 90%+ red, 70%+ amber,
  * otherwise green, with a dim dash when usage is unknown (right after a
@@ -78,7 +76,7 @@
  * Commands:
  *   /doomhud        toggle the HUD on/off
  *   /doomhud image  force the real pixel face (where supported)
- *   /doomhud text   force the quadrant-block face
+ *   /doomhud text   force the half-block face
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -89,6 +87,7 @@ import { join, dirname, basename } from "node:path";
 import { fileURLToPath } from "node:url";
 import { inflateSync, deflateSync } from "node:zlib";
 import { execSync } from "node:child_process";
+import { billedTokenCount, blendedCostPerMillion } from "./token-economics.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -198,6 +197,10 @@ const BAND_COUNT = 5;
 // line-capped to 10 rows, and height is what buys face detail: more bar rows
 // means more face rows.
 const HUD_ROWS = 13;
+// The text fallback is one sample wide per terminal column. A modest horizontal
+// stretch gives the compact portrait more of the broad, square Doom status-face
+// proportions without changing the image-protocol rendering.
+const TEXT_FACE_ASPECT_SCALE = 1.25;
 
 // ── Doom HUD palette ───────────────────────────────────────────────────────
 // The classic Doom status bar: dark gunmetal steel panels with a beveled
@@ -495,7 +498,17 @@ interface AssistantUsage {
 	output?: number;
 	cacheRead?: number;
 	cacheWrite?: number;
-	cost?: { total?: number };
+	cost?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number };
+}
+
+interface TurnCostDelta {
+	input: number;
+	cacheRead: number;
+	cacheWrite: number;
+	output: number;
+	other: number;
+	total: number;
+	cacheWriteTokens: number;
 }
 
 /** Everything the status bar needs, gathered from the live context + entries. */
@@ -505,9 +518,9 @@ export interface HudData {
 	contextTokens: number | null; // current context occupancy, used for test overrides
 	window: number;          // model context window in tokens (the TOKENS tile)
 	cost: number;            // session cost USD, the COST tile's big number
-	// Right-hand tile rows: label plus an already-formatted value, so all five
-	// readings share one right-aligned column.
-	stats: { label: string; value: string }[];
+	costDelta?: number;      // usage cost from the latest completed agent run
+	// Right-hand tile rows: label plus token/cost data, sharing aligned columns.
+	stats: { label: string; value: string; deltaCost?: number; deltaTokens?: number }[];
 	modelId: string;       // the model id, the MODEL tile's big value (wraps on '-')
 	thinking: string;      // thinking level, the MODEL tile's line under the name
 	provider: string;      // model provider, the MODEL tile's caption
@@ -519,6 +532,33 @@ function finiteNumber(v: unknown): number | undefined {
 	return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
+/** Cost accumulated by assistant and nested tool usage in one completed agent run. */
+function turnCostDeltaFromMessages(messages: readonly unknown[]): TurnCostDelta | null {
+	const delta: TurnCostDelta = { input: 0, cacheRead: 0, cacheWrite: 0, output: 0, other: 0, total: 0, cacheWriteTokens: 0 };
+	let foundUsage = false;
+	for (const item of messages) {
+		const message = item as Record<string, any>;
+		if (message.role !== "assistant" && message.role !== "toolResult") continue;
+		const usage = message.usage as AssistantUsage | undefined;
+		if (!usage) continue;
+		const writeTokens = finiteNumber(usage.cacheWrite) ?? 0;
+		const input = finiteNumber(usage.cost?.input) ?? 0;
+		const cacheRead = finiteNumber(usage.cost?.cacheRead) ?? 0;
+		const cacheWrite = finiteNumber(usage.cost?.cacheWrite) ?? 0;
+		const output = finiteNumber(usage.cost?.output) ?? 0;
+		const total = finiteNumber(usage.cost?.total) ?? input + cacheRead + cacheWrite + output;
+		delta.input += input;
+		delta.cacheRead += cacheRead;
+		delta.cacheWrite += cacheWrite;
+		delta.output += output;
+		delta.other += Math.max(0, total - input - cacheRead - cacheWrite - output);
+		delta.total += total;
+		delta.cacheWriteTokens += writeTokens;
+		foundUsage = true;
+	}
+	return foundUsage ? delta : null;
+}
+
 /**
  * Gather all the live stats the HUD needs. Mirrors pi's footer logic for cost
  * (session entries + subagent artifacts) and adds token/usage/tool/message
@@ -528,6 +568,7 @@ function collectHudData(
 	ctx: ExtensionContext,
 	entries: readonly unknown[],
 	subagentCost: number,
+	turnDelta: TurnCostDelta | null = null,
 ): HudData {
 	const usage = ctx.getContextUsage();
 	const usagePct = usage?.percent != null ? Math.round(usage.percent) : null;
@@ -536,23 +577,48 @@ function collectHudData(
 	// health (a fresh window) rather than no health.
 	const health = Math.max(0, Math.min(100, 100 - (usagePct ?? 0)));
 
-	// The session's token economics, all reported per assistant message.
+	// Cumulative session totals. CACHE and BLENDED use the same session window;
+	// Pi's footer CH value is per-request and can differ.
 	let tokensIn = 0;
 	let tokensOut = 0;
 	let cacheRead = 0;
 	let cacheWrite = 0;
+	let latestCacheRead: number | null = null;
+	let billedTokens = 0;
+	let inputCost = 0;
+	let outputCost = 0;
+	let cacheReadCost = 0;
+	let cacheWriteCost = 0;
 	let cost = 0;
-	// Spend and tokens from every usage-bearing entry, so the blended rate below
-	// divides like by like. Subagent spend is tracked separately because only its
-	// cost is knowable, never its token counts.
+	// Spend and provider-reported token totals from every usage-bearing entry.
+	// Subagent spend is separate because its token counts are unavailable here.
 	let tokenCost = 0;
 	const addUsage = (u: AssistantUsage | undefined): void => {
 		if (!u) return;
-		tokensIn += finiteNumber(u.input) ?? 0;
-		tokensOut += finiteNumber(u.output) ?? 0;
-		cacheRead += finiteNumber(u.cacheRead) ?? 0;
-		cacheWrite += finiteNumber(u.cacheWrite) ?? 0;
-		tokenCost += finiteNumber(u.cost?.total) ?? 0;
+		const input = finiteNumber(u.input) ?? 0;
+		const output = finiteNumber(u.output) ?? 0;
+		const cacheReadTokens = finiteNumber(u.cacheRead) ?? 0;
+		const cacheWriteTokens = finiteNumber(u.cacheWrite) ?? 0;
+		tokensIn += input;
+		tokensOut += output;
+		cacheRead += cacheReadTokens;
+		cacheWrite += cacheWriteTokens;
+		billedTokens += billedTokenCount({
+			input,
+			output,
+			cacheRead: cacheReadTokens,
+			cacheWrite: cacheWriteTokens,
+		});
+		const inputCostPart = finiteNumber(u.cost?.input) ?? 0;
+		const outputCostPart = finiteNumber(u.cost?.output) ?? 0;
+		const cacheReadCostPart = finiteNumber(u.cost?.cacheRead) ?? 0;
+		const cacheWriteCostPart = finiteNumber(u.cost?.cacheWrite) ?? 0;
+		inputCost += inputCostPart;
+		outputCost += outputCostPart;
+		cacheReadCost += cacheReadCostPart;
+		cacheWriteCost += cacheWriteCostPart;
+		tokenCost += finiteNumber(u.cost?.total)
+			?? inputCostPart + outputCostPart + cacheReadCostPart + cacheWriteCostPart;
 	};
 	for (const e of entries) {
 		const entry = e as Record<string, any>;
@@ -567,7 +633,9 @@ function collectHudData(
 		}
 		const msg = entry.message as Record<string, any> | undefined;
 		if (msg?.role === "assistant") {
-			addUsage((msg as { usage?: AssistantUsage }).usage);
+			const assistantUsage = (msg as { usage?: AssistantUsage }).usage;
+			addUsage(assistantUsage);
+			latestCacheRead = assistantUsage ? finiteNumber(assistantUsage.cacheRead) ?? 0 : null;
 		} else if (msg?.role === "toolResult") {
 			// Nested tool LLM usage, if pi folded any onto the message.
 			addUsage((msg as { usage?: AssistantUsage }).usage);
@@ -578,23 +646,26 @@ function collectHudData(
 	const window = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 	const thinking = ctx.thinkingLevel ?? "off";
 
-	// Right-hand tile: what this session is costing per token. CACHE is the
-	// prompt-cache hit rate (how much of the prompt was served from cache), IN and
-	// OUT are the fresh token split, and BLENDED is the rate actually being paid
-	// per million tokens across every token type. All of it moves as the session
-	// runs, because every row is recomputed from live usage.
-	const billable = tokensIn + tokensOut + cacheRead + cacheWrite;
-	const promptTokens = tokensIn + cacheRead + cacheWrite;
-	const cachePct = promptTokens > 0 ? Math.round((cacheRead / promptTokens) * 100) : 0;
-	// Token-bearing spend only: subagent cost has no token counts to divide by, so
-	// including it would inflate the rate.
-	const perMillion = billable > 0 ? (tokenCost / billable) * 1_000_000 : 0;
+	// Show every billed bucket beside its cost so the main COST amount can be
+	// audited. Amounts use three decimals to match the COST panel.
+	const tokenColumnWidth = Math.max(
+		...[tokensIn, cacheRead, cacheWrite, tokensOut].map((n) => fmtUsageTokens(n).length),
+	);
+	const tokenCostValue = (tokens: number, amount: number): string =>
+		`${fmtUsageTokens(tokens).padStart(tokenColumnWidth)} $${amount.toFixed(3)}`;
+	const perMillion = blendedCostPerMillion(tokenCost, billedTokens);
+	const bucketCost = inputCost + cacheReadCost + cacheWriteCost + outputCost;
+	const otherCost = Math.max(0, cost - bucketCost);
+	const latestCacheValue = (latestCacheRead == null ? "---" : fmtUsageTokens(latestCacheRead)).padStart(tokenColumnWidth);
 	const stats = [
-		{ label: "CACHE", value: promptTokens > 0 ? `${cachePct}%` : "---" },
-		{ label: "IN", value: fmtNum(tokensIn) },
-		{ label: "OUT", value: fmtNum(tokensOut) },
-		{ label: "BLENDED", value: perMillion > 0 ? `$${perMillion.toFixed(3)}` : "---" },
+		{ label: "CACHE", value: latestCacheValue, deltaTokens: turnDelta?.cacheWriteTokens },
+		{ label: "CACHE READ", value: tokenCostValue(cacheRead, cacheReadCost), deltaCost: turnDelta?.cacheRead },
+		{ label: "CACHE WRITE", value: tokenCostValue(cacheWrite, cacheWriteCost), deltaCost: turnDelta?.cacheWrite },
+		{ label: "IN", value: tokenCostValue(tokensIn, inputCost), deltaCost: turnDelta?.input },
+		{ label: "OUT", value: tokenCostValue(tokensOut, outputCost), deltaCost: turnDelta?.output },
+		{ label: "BLENDED", value: perMillion > 0 ? `$${perMillion.toFixed(3)}/M` : "---" },
 	];
+	if (otherCost > 0.0000005) stats.push({ label: "OTHER", value: `$${otherCost.toFixed(3)}`, deltaCost: turnDelta?.other });
 
 	// The MODEL tile shows the model id, broken on "-", with the thinking level
 	// on its own line underneath and the provider beneath that.
@@ -638,6 +709,7 @@ function collectHudData(
 		contextTokens,
 		window,
 		cost,
+		costDelta: turnDelta?.total,
 		stats,
 		modelId,
 		thinking,
@@ -827,7 +899,7 @@ const anim = {
 	health: 100,
 	enabled: true,
 	// Prefer the pixel face. When the terminal has no image protocol, renderHudBar
-	// automatically uses the quadrant-block fallback; /doomhud text forces it.
+	// automatically uses the half-block fallback; /doomhud text forces it.
 	imageFace: true,
 	healthOverride: null as number | null,
 	overrideContextTokens: null as number | null,
@@ -1109,49 +1181,37 @@ function fmtNum(n: number): string {
 	return `${n}`;
 }
 
+/** Format millions to one decimal and thousands to the nearest whole token unit. */
+function fmtUsageTokens(n: number): string {
+	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}m`;
+	if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+	return `${n}`;
+}
+
 /**
- * Render the head as solid Unicode block glyphs: each character cell becomes a
- * 2x2 grid of subpixels, and the 16 possible patterns map exactly onto the
- * quadrant/half-block glyphs (space, quadrants, halves, diagonals, full block).
- *
- * Solid blocks beat a finer dot grid here. Braille carries eight subpixels per
- * cell on paper, but it needs a font that has the glyphs, and when the font
- * lacks them the terminal substitutes Apple Braille, whose dots cover a
- * fraction of the cell. The ground colour then dominates and the face washes
- * out into flat blocks. Quadrants exist in every terminal font and fill every
- * subpixel solidly.
- *
- * For each cell we area-average the source into its four subpixels, then try
- * every split into two colour clusters and keep the tightest one. The brighter
- * cluster becomes the foreground, so the glyph's "on" bits read as the lit part
- * of the face. Searching from mask 0 upward with a strict comparison lets flat
- * cells settle on "no ink" instead of dithering their own noise.
+ * Render the head with Unicode upper-half blocks. Each terminal cell represents
+ * two vertically stacked source samples: the top half uses the foreground and
+ * the bottom half the background. This gives every terminal column its own
+ * horizontal sample and uses both half-cell colors directly.
  */
-const QUAD_GLYPHS = [" ", "\u2598", "\u259d", "\u2580", "\u2596", "\u258c", "\u259e", "\u259b",
-	"\u2597", "\u259a", "\u2590", "\u259c", "\u2584", "\u2599", "\u259f", "\u2588"];
 const blockCache = new Map<string, string[]>();
 
 /**
- * Fit a face onto a `dotW` x `dotH` subpixel grid, preserving its aspect and
- * centring it.
- *
- * `cellRatio` is the terminal cell's height/width (about 2 for a typical cell),
- * and it matters: a subpixel is not square, it is (cellW/2) x (cellH/2), so the
- * dot grid needs to be `aspect * cellRatio` as wide as it is tall for the face
- * to come out undistorted. Get that wrong and the head gets letterboxed into a
- * strip down the middle of the panel.
+ * Fit a face onto a `dotW` x `dotH` sample grid, preserving its aspect and
+ * centring it. `pixelRatio` is the physical height/width ratio of one sample.
+ * For half blocks this is half the terminal cell's height/width ratio.
  */
-function fitFace(face: Frame, dotW: number, dotH: number, cellRatio: number) {
-	const srcAspect = face.height > 0 ? face.width / face.height : 0.8;
-	const want = srcAspect * cellRatio; // required dot-grid width / height
+function fitFace(face: Frame, dotW: number, dotH: number, pixelRatio: number, aspectScale = 1) {
+	const srcAspect = (face.height > 0 ? face.width / face.height : 0.8) * aspectScale;
+	const want = srcAspect * pixelRatio; // required sample-grid width / height
 	let w = dotW, h = dotH;
 	if (want < dotW / dotH) w = Math.max(1, Math.round(h * want));
 	else h = Math.max(1, Math.round(w / want));
 	return { dotW: w, dotH: h, offX: Math.floor((dotW - w) / 2), offY: Math.floor((dotH - h) / 2) };
 }
 
-function renderBlockFace(face: Frame, cells: number, rows: number, cellRatio: number): string[] {
-	const key = `${face.name}|${cells}|${rows}|${cellRatio.toFixed(3)}`;
+function renderBlockFace(face: Frame, cells: number, rows: number, cellRatio: number, aspectScale: number): string[] {
+	const key = `${face.name}|${cells}|${rows}|${cellRatio.toFixed(3)}|${aspectScale.toFixed(3)}`;
 	const cached = blockCache.get(key);
 	if (cached) return cached;
 
@@ -1161,72 +1221,57 @@ function renderBlockFace(face: Frame, cells: number, rows: number, cellRatio: nu
 	// here would paint a dark rectangle around the head.
 	const ground: Col = [HUD.steel.r, HUD.steel.g, HUD.steel.b];
 	const R = (v: number) => Math.round(Math.max(0, Math.min(255, v)));
-	const fit = fitFace(face, cells * 2, rows * 2, cellRatio);
+	const fit = fitFace(face, cells, rows * 2, cellRatio / 2, aspectScale);
 
-	/** Alpha-weighted average colour of a source rect; transparent → panel bg. */
-	const avg = (x0: number, x1: number, y0: number, y1: number): Col => {
-		const cx0 = Math.max(0, Math.floor(x0)), cx1 = Math.min(srcW, Math.ceil(x1));
-		const cy0 = Math.max(0, Math.floor(y0)), cy1 = Math.min(srcH, Math.ceil(y1));
-		let r = 0, g = 0, b = 0, a = 0;
-		for (let y = cy0; y < cy1; y++) {
-			for (let x = cx0; x < cx1; x++) {
-				const al = face.fbA[y * srcW + x] ?? 0;
-				if (al <= 8) continue;
-				const i = (y * srcW + x) * 3;
-				r += face.fbPx[i]! * al; g += face.fbPx[i + 1]! * al; b += face.fbPx[i + 2]! * al;
-				a += al;
-			}
-		}
-		if (a === 0) return ground;
-		return [r / a, g / a, b / a];
+	/** Nearest source pixel, composited over the steel panel if translucent. */
+	const samplePixel = (x: number, y: number): Col => {
+		if (x < 0 || y < 0 || x >= fit.dotW || y >= fit.dotH) return ground;
+		// Match pi-doom's top-left nearest-pixel sampling. Center sampling can skip
+		// narrow highlights such as the pale eye pixels after a large downscale.
+		const sx = Math.min(srcW - 1, Math.floor((x * srcW) / fit.dotW));
+		const sy = Math.min(srcH - 1, Math.floor((y * srcH) / fit.dotH));
+		const pixel = sy * srcW + sx;
+		const alpha = (face.fbA[pixel] ?? 0) / 255;
+		if (alpha <= 8 / 255) return ground;
+		const i = pixel * 3;
+		return [
+			face.fbPx[i]! * alpha + ground[0] * (1 - alpha),
+			face.fbPx[i + 1]! * alpha + ground[1] * (1 - alpha),
+			face.fbPx[i + 2]! * alpha + ground[2] * (1 - alpha),
+		];
+	};
+	/** Gently warm and lighten the sclera pixels without painting them pure white. */
+	const softenEyeSclera = (x: number, y: number, color: Col): Col => {
+		const nx = (x + 0.5) / fit.dotW;
+		const ny = (y + 0.5) / fit.dotH;
+		const inEye = ny >= 0.53 && ny <= 0.59
+			&& ((nx >= 0.31 && nx <= 0.39) || (nx >= 0.61 && nx <= 0.69));
+		const [r, g, b] = color;
+		const luminance = 0.299 * r + 0.587 * g + 0.114 * b;
+		if (!inEye || r <= g + 20 || r <= b + 20 || luminance <= 45) return color;
+		const target: Col = [242, 219, 193];
+		const blend = 0.62;
+		return [
+			Math.round(r * (1 - blend) + target[0] * blend),
+			Math.round(g * (1 - blend) + target[1] * blend),
+			Math.round(b * (1 - blend) + target[2] * blend),
+		];
 	};
 
-	const lum = (c: Col) => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
 	const lines: string[] = [];
 	for (let ry = 0; ry < rows; ry++) {
 		let line = "";
 		for (let cx = 0; cx < cells; cx++) {
-			// Subpixel order matches QUAD_GLYPHS bit order: TL, TR, BL, BR.
-			const sub: Col[] = new Array(4);
-			for (let i = 0; i < 4; i++) {
-				const dx = i % 2, dy = (i - dx) / 2;
-				const lx = cx * 2 + dx - fit.offX;
-				const ly = ry * 2 + dy - fit.offY;
-				sub[i] = lx < 0 || ly < 0 || lx >= fit.dotW || ly >= fit.dotH
-					? ground
-					: avg(
-						(lx * srcW) / fit.dotW, ((lx + 1) * srcW) / fit.dotW,
-						(ly * srcH) / fit.dotH, ((ly + 1) * srcH) / fit.dotH,
-					);
-			}
-			let bestMask = 0, bestCost = Infinity;
-			let bestOn: Col = ground, bestOff: Col = ground;
-			for (let m = 0; m < 16; m++) {
-				let onN = 0, offN = 0, onR = 0, onG = 0, onB = 0, offR = 0, offG = 0, offB = 0;
-				for (let i = 0; i < 4; i++) {
-					const c = sub[i]!;
-					if (m & (1 << i)) { onR += c[0]; onG += c[1]; onB += c[2]; onN++; }
-					else { offR += c[0]; offG += c[1]; offB += c[2]; offN++; }
-				}
-				const on: Col = onN ? [onR / onN, onG / onN, onB / onN] : ground;
-				const off: Col = offN ? [offR / offN, offG / offN, offB / offN] : ground;
-				let cost = 0;
-				for (let i = 0; i < 4; i++) {
-					const c = sub[i]!;
-					const t = m & (1 << i) ? on : off;
-					const dr = c[0] - t[0], dg = c[1] - t[1], db = c[2] - t[2];
-					cost += dr * dr + dg * dg + db * db;
-				}
-				if (cost < bestCost) { bestCost = cost; bestMask = m; bestOn = on; bestOff = off; }
-			}
-			// Ink carries the brighter cluster, so glyph bits are the lit pixels.
-			let ink = bestOn, groundCol = bestOff, mask = bestMask;
-			if (lum(ink) < lum(groundCol)) { ink = bestOff; groundCol = bestOn; mask ^= 0xf; }
-			const bgSeq = `\x1b[48;2;${R(groundCol[0])};${R(groundCol[1])};${R(groundCol[2])}m`;
-			if (mask === 0) {
+			const x = cx - fit.offX;
+			const topY = ry * 2 - fit.offY;
+			const topRgb = softenEyeSclera(x, topY, samplePixel(x, topY)).map(R) as Col;
+			const bottomRgb = softenEyeSclera(x, topY + 1, samplePixel(x, topY + 1)).map(R) as Col;
+			const bgSeq = `\x1b[48;2;${bottomRgb[0]};${bottomRgb[1]};${bottomRgb[2]}m`;
+			if (topRgb.every((v, i) => v === bottomRgb[i])) {
+				// A space with a background colour fills the full cell without a glyph.
 				line += `${bgSeq} `;
 			} else {
-				line += `\x1b[38;2;${R(ink[0])};${R(ink[1])};${R(ink[2])}m${bgSeq}${QUAD_GLYPHS[mask]}`;
+				line += `\x1b[38;2;${topRgb[0]};${topRgb[1]};${topRgb[2]}m${bgSeq}▀`;
 			}
 		}
 		line += "\x1b[0m";
@@ -1408,7 +1453,7 @@ function cells(s: string): string {
 function sanitizeHud(hud: HudData): HudData {
 	return {
 		...hud,
-		stats: hud.stats.map((s) => ({ label: cells(s.label), value: cells(s.value) })),
+		stats: hud.stats.map((s) => ({ label: cells(s.label), value: cells(s.value), deltaCost: s.deltaCost, deltaTokens: s.deltaTokens })),
 		modelId: cells(hud.modelId),
 		thinking: cells(hud.thinking),
 		provider: cells(hud.provider),
@@ -1439,6 +1484,10 @@ export function renderHudBar(
 	faceName: string,
 ): string[] {
 	const d = sanitizeHud(hud);
+	const caps = getCapabilities();
+	const protocol = caps.images === "kitty" ? "kitty" : caps.images === "iterm2" ? "iterm2" : null;
+	const useImageFace = imageFace && protocol !== null;
+	const faceAspectScale = useImageFace ? 1 : TEXT_FACE_ASPECT_SCALE;
 	const H = HUD_ROWS;
 	const GAP = 1;
 	// pi-tui *throws* (and stops the TUI) if any line is wider than the terminal,
@@ -1455,7 +1504,7 @@ export function renderHudBar(
 	// sets the panel shape: a face `rows` tall has `2 * rows * aspect` cells
 	// across, which keeps the subpixels square and the head unstretched.
 	const face = frames.get(faceName) ?? frames.values().next().value;
-	const cropAspect = stableFaceAspect(frames);
+	const cropAspect = stableFaceAspect(frames) * faceAspectScale;
 	let faceRows = H - 2;
 	let faceW = Math.max(8, Math.round(faceRows * 2 * cropAspect));
 	const maxFaceW = Math.max(12, Math.round(width * 0.22));
@@ -1470,7 +1519,14 @@ export function renderHudBar(
 	// much more each tile wanted, so a narrow terminal squeezes the tiles in
 	// proportion to their own content instead of starving one of them.
 	const rest = Math.max(0, width - W_FACE - GAP * 5);
-	const moneySymW = glyphRows("$")[0]!.length;	const statRows = d.stats.slice(0, 4);
+	const moneySymW = glyphRows("$")[0]!.length;	const statRows = d.stats.slice(0, 8);
+	const formatCostDelta = (amount: number) => `(+$${amount.toFixed(3)})`;
+	const formatStatDelta = (row: HudData["stats"][number]): string => {
+		if (row.deltaCost !== undefined && row.deltaCost > 0) return formatCostDelta(row.deltaCost);
+		if (row.deltaTokens !== undefined && row.deltaTokens > 0) return `(+${fmtUsageTokens(row.deltaTokens)})`;
+		return "";
+	};
+	const deltaWidth = Math.max(0, ...statRows.map((row) => formatStatDelta(row).length));
 	const valueW = Math.max(1, ...statRows.map((r) => r.value.length));
 	const maxLabel = Math.max(1, ...statRows.map((r) => r.label.length));
 	const floors = [
@@ -1531,6 +1587,7 @@ export function renderHudBar(
 	// width and the slack lands somewhere useful rather than on the stats tile.
 	if (budget >= used) w5[3]! += budget - used;
 	const [W_AMMO, W_HEALTH, W_ARMS, W_ARMOR, W_LIST] = w5;
+	const showDeltas = showList && deltaWidth > 0 && W_LIST >= floors[4]! + deltaWidth + 2;
 
 	// Panel widths, indexed by identity so the drawing code below can keep
 	// addressing them by name: 0 TOKENS, 1 CONTEXT, 2 MODEL, 3 COST, 4 stats,
@@ -1683,10 +1740,8 @@ export function renderHudBar(
 	if (face) {
 		const faceX = xs[5]! + 1;
 		const startY = y0 + Math.max(1, Math.floor((H - faceRows) / 2));
-		const caps = getCapabilities();
-		const protocol = caps.images === "kitty" ? "kitty" : caps.images === "iterm2" ? "iterm2" : null;
 		const cellDim = getCellDimensions();
-		if (protocol && imageFace) {
+		if (useImageFace && protocol) {
 			// One image per face row. See the header comment: a one-cell-tall image
 			// is the only shape that survives pi-tui repainting the panel cells that
 			// share its rows, and it leaves the cursor on its own line.
@@ -1709,7 +1764,7 @@ export function renderHudBar(
 			}
 		} else {
 			const cellRatio = cellDim.heightPx / Math.max(1, cellDim.widthPx);
-			const faceLines = renderBlockFace(face, faceW, faceRows, cellRatio);
+			const faceLines = renderBlockFace(face, faceW, faceRows, cellRatio, faceAspectScale);
 			for (let r = 0; r < faceLines.length; r++) {
 				const y = startY + r;
 				if (y >= H) break;
@@ -1721,6 +1776,13 @@ export function renderHudBar(
 	// 5. COST (the real session spend, three decimals, with a full-size $)
 	fillPanel(grid, xs[3]!, y0, W_ARMOR, H);
 	putMoney(xs[3]!, W_ARMOR, d.cost, HUD.red);
+	if (showDeltas && d.costDelta !== undefined && d.costDelta > 0) {
+		const delta = formatCostDelta(d.costDelta);
+		if (delta.length <= W_ARMOR - 2) {
+			const dx = xs[3]! + Math.floor((W_ARMOR - delta.length) / 2);
+			putText(grid, dx, lblRow - 1, delta, HUD.green, xs[3]! + W_ARMOR - 1);
+		}
+	}
 	putCenteredLabel(xs[3]!, W_ARMOR, "COST", HUD.white);
 
 	// 6. Right tile: the session's token economics, one reading per row with the
@@ -1731,20 +1793,28 @@ export function renderHudBar(
 	if (showList) {
 		fillPanel(grid, xs[4]!, y0, W_LIST, H);
 		const listX = xs[4]!;
-		// Left-aligned label, right-aligned value, or the value pushed right if the
-		// label needs the room first.
-		const valueX = listX + Math.max(STAT_PAD + maxLabel + 1, W_LIST - 1 - STAT_PAD - valueW);
+		// Values remain aligned. Turn deltas get a separate right-hand column, but
+		// they are omitted when the compacted panel has no room for that column.
+		const deltaSpace = showDeltas ? deltaWidth + 1 : 0;
+		const valueXWithoutDelta = listX + Math.max(STAT_PAD + maxLabel + 1, W_LIST - 1 - STAT_PAD - valueW);
+		const valueX = showDeltas
+			? listX + Math.max(STAT_PAD + maxLabel + 1, W_LIST - 1 - STAT_PAD - valueW - deltaSpace)
+			: valueXWithoutDelta;
+		const deltaX = valueX + valueW + 1;
+		const deltaRight = listX + W_LIST - 1 - STAT_PAD;
 		for (let i = 0; i < statRows.length; i++) {
 			const row = statRows[i]!;
-			// Rows 2, 4, 6, 8: the block brackets the other tiles' figure rows (3-7)
-			// with a blank row above it, and the caption then lands on the title row.
-			const sy = 2 + i * 2;
-			if (!grid[sy]) continue;
+			// Use consecutive interior rows so the tile can show token buckets,
+			// ratios, and cost detail while keeping its caption on the last row.
+			const sy = 2 + i;
+			if (!grid[sy] || sy >= lblRow) break;
 			// The label column stops at the value block, so a long label can never
 			// run into the numbers.
 			putText(grid, listX + STAT_PAD, sy, row.label, HUD.white, valueX - 1);
 			putText(grid, valueX, sy, row.value, HUD.gold);
 			boldRange(valueX, sy, row.value.length);
+			const delta = formatStatDelta(row);
+			if (showDeltas && delta) putText(grid, deltaX, sy, delta, HUD.green, deltaRight + 1);
 		}
 		// Caption: cwd basename (bold) then the git branch in brackets, drawn in two
 		// colours so the branch reads as the part that changes. If both will not fit,
@@ -1924,26 +1994,28 @@ export default async function (pi: ExtensionAPI) {
 
 	let active: DoomHudComponent | null = null;
 	let ctxRef: ExtensionContext | null = null;
+	let lastTurnCostDelta: TurnCostDelta | null = null;
 
 	function refresh() {
 		if (!ctxRef || !active) return;
 		const entries = ctxRef.sessionManager.getEntries();
 		const sessionFile = ctxRef.sessionManager.getSessionFile();
 		resetCostCacheForSession(sessionFile);
-		const data = collectHudData(ctxRef, entries, subagentCostTotal());
+		const data = collectHudData(ctxRef, entries, subagentCostTotal(), lastTurnCostDelta);
 		active.setCompacting(anim.compacting);
 		active.setHudData(data);
 		// Subagent spend is resolved from artifacts on disk, so it lands a moment
 		// after the first paint. Redraw once it does.
 		loadSubagentCosts(entries, () => {
 			if (!ctxRef || !active) return;
-			active.setHudData(collectHudData(ctxRef, ctxRef.sessionManager.getEntries(), subagentCostTotal()));
+			active.setHudData(collectHudData(ctxRef, ctxRef.sessionManager.getEntries(), subagentCostTotal(), lastTurnCostDelta));
 		});
 	}
 
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
 		ctxRef = ctx;
+		lastTurnCostDelta = null;
 		DoomHudComponent.resetTransient();
 		// Replace pi's built-in status footer; the HUD already presents its useful stats.
 		ctx.ui.setFooter(() => ({ render: () => [], invalidate() {} }));
@@ -1974,6 +2046,12 @@ export default async function (pi: ExtensionAPI) {
 	(pi as { on: (event: string, handler: (event: unknown, ctx: ExtensionContext) => void) => void }).on(
 		"session_compact_failed", (_e, c) => { ctxRef = c; active?.setCompacting(false); refresh(); });
 
+	pi.on("agent_start", (_e, c) => { ctxRef = c; lastTurnCostDelta = null; refresh(); });
+	pi.on("agent_end", (event, c) => {
+		ctxRef = c;
+		lastTurnCostDelta = turnCostDeltaFromMessages(event.messages);
+		refresh();
+	});
 	pi.on("message_update", (_e, c) => { ctxRef = c; refresh(); });
 	pi.on("message_end", (_e, c) => { ctxRef = c; refresh(); });
 	pi.on("tool_execution_end", (_e, c) => { ctxRef = c; refresh(); });
@@ -2019,7 +2097,7 @@ export default async function (pi: ExtensionAPI) {
 				}
 			} else if (a === "text") {
 				active?.setImageFace(false);
-				ctx.ui.notify("Doom HUD: quadrant-block face", "info");
+				ctx.ui.notify("Doom HUD: half-block face", "info");
 			} else {
 				anim.enabled = !anim.enabled;
 				active?.setEnabled(anim.enabled);
@@ -2027,4 +2105,5 @@ export default async function (pi: ExtensionAPI) {
 			}
 		},
 	});
+
 }

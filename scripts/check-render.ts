@@ -4,6 +4,7 @@
 //
 //   npm test
 import { loadFrames, renderHudBar } from "../extensions/doom-hud/index.ts";
+import { billedTokenCount, blendedCostPerMillion, promptTokenCount } from "../extensions/doom-hud/token-economics.ts";
 import type { HudData } from "../extensions/doom-hud/index.ts";
 
 /** Strip SGR/mode escapes and count visible columns (every glyph used is width 1). */
@@ -18,11 +19,14 @@ function hudWith(usagePct: number | null, window: number, cost: number): HudData
 		contextTokens: usagePct == null ? null : Math.round(window * (usagePct / 100)),
 		window,
 		cost,
+		costDelta: 0.02,
 		stats: [
-			{ label: "CACHE", value: "98%" },
-			{ label: "IN", value: "18.4k" },
-			{ label: "OUT", value: "534" },
-			{ label: "BLENDED", value: "$1.203" },
+			{ label: "CACHE", value: " 326k", deltaTokens: 32_000},
+			{ label: "CACHE READ", value: "37.2m $0.372", deltaCost: 0.005 },
+			{ label: "CACHE WRITE", value: " 467k $0.058", deltaCost: 0.001 },
+			{ label: "IN", value: " 264k $0.026", deltaCost: 0.012 },
+			{ label: "OUT", value: " 251k $0.125", deltaCost: 0.002 },
+			{ label: "BLENDED", value: "$0.015/M" },
 		],
 		modelId: "claude-opus-4-5-extended-thinking",
 		thinking: "xhigh",
@@ -39,6 +43,22 @@ const fail = (msg: string) => {
 	console.error("FAIL: " + msg);
 };
 
+// Blended price uses all four Pi usage buckets. Counts and component costs
+// remain separate so the session total can be checked from the displayed rows.
+{
+	const promptTokens = promptTokenCount(100, 700, 50);
+	if (promptTokens !== 850) fail(`prompt token count is ${promptTokens}, want 850`);
+	const total = billedTokenCount({ input: 100, output: 200, cacheRead: 700, cacheWrite: 50 });
+	if (total !== 1_050) fail(`billed token count is ${total}, want 1050`);
+	const usageCost = 0.0021;
+	const blended = blendedCostPerMillion(usageCost, total);
+	if (Math.abs(blended - 2) > 1e-9) fail(`blended rate is $${blended}, want $2.000 per million tokens`);
+	const recoveredCost = blended * total / 1_000_000;
+	if (Math.abs(recoveredCost - usageCost) > 1e-12) fail(`displayed token total recovers $${recoveredCost}, want $${usageCost}`);
+	const partialTotal = billedTokenCount({ input: 100, output: 200, cacheRead: 700 });
+	if (partialTotal !== 1_000) fail(`partial billed token count is ${partialTotal}, want 1000`);
+}
+
 if (frames.size === 0) fail("no face frames loaded");
 for (const t of [1, 2, 3, 4, 5]) {
 	for (const kind of ["left", "neutral", "right", "focus"]) {
@@ -47,6 +67,19 @@ for (const t of [1, 2, 3, 4, 5]) {
 	}
 }
 if (!frames.has("dead")) fail("missing frame dead");
+
+// The text fallback should use only full-width upper-half blocks, not the old
+// quadrant mosaics. This keeps one independent horizontal sample per cell.
+{
+	const textFace = renderHudBar(frames, hudWith(45, 200_000, 1.694), false, 120, "tier3_neutral");
+	if (!textFace.some((line) => line.includes("▀"))) fail("text fallback did not render half-block face pixels");
+	const faceAnsi = textFace.join("");
+	if (!faceAnsi.includes("191;148;130")) fail("text fallback did not soften the eye highlights");
+	if (faceAnsi.includes("255;244;224")) fail("text fallback eye highlights are too white");
+	if (textFace.some((line) => /[▖▗▘▙▚▛▜▝▞▟▄▌▐]/u.test(line))) {
+		fail("text fallback still contains quadrant-block face pixels");
+	}
+}
 
 const faces = ["tier1_left", "tier1_neutral", "tier3_right", "tier5_focus", "dead"];
 const huds: HudData[] = [
@@ -116,16 +149,39 @@ for (let width = 24; width <= 260; width++) {
 }
 
 // The stats tile is dropped rather than squeezed when the terminal cannot hold
-// it, and its four readings must be legible whenever it is shown.
+// it, and its token/cost breakdown must be legible whenever it is shown.
 {
-	const strip = (lines: string[]) => lines.map((l) => l.replace(/\x1b\[[0-9;]*m/g, "")).join("\n");
+	const stripLine = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+	const strip = (lines: string[]) => lines.map(stripLine).join("\n");
 	const narrow = strip(renderHudBar(frames, hudWith(45, 200_000, 1.694), false, 100, "tier3_neutral"));
-	if (narrow.includes("CACHE")) fail("stats tile shown at 100 columns, where it cannot fit its values");
+	if (narrow.includes("CACHE READ")) fail("stats tile shown at 100 columns, where it cannot fit its values");
 	if (!narrow.includes("TOKENS") || !narrow.includes("COST")) fail("headline tiles missing at 100 columns");
-	const wide = strip(renderHudBar(frames, hudWith(45, 200_000, 1.694), false, 140, "tier3_neutral"));
-	for (const needle of ["CACHE", "98%", "18.4k", "534", "$1.203"]) {
+	const wideLines = renderHudBar(frames, hudWith(45, 200_000, 1.694), false, 140, "tier3_neutral");
+	const wide = strip(wideLines);
+	for (const needle of ["CACHE", "326k", "CACHE READ", "37.2m", "$0.372", "CACHE WRITE", "467k", "$0.058", "IN", "264k", "$0.026", "OUT", "251k", "$0.125", "BLENDED", "$0.015/M"]) {
 		if (!wide.includes(needle)) fail(`stats reading \"${needle}\" missing at 140 columns`);
 	}
+	const statLines = wideLines.map(stripLine);
+	const dollarColumns = ["$0.372", "$0.058", "$0.026", "$0.125"].map((marker) => {
+		const line = statLines.find((candidate) => candidate.includes(marker));
+		return line ? line.indexOf(marker) : -1;
+	});
+	if (dollarColumns.some((column) => column < 0) || new Set(dollarColumns).size !== 1) {
+		fail(`token bucket cost values are not aligned: ${dollarColumns.join(",")}`);
+	}
+	const tokenEnds = ["326k", "37.2m", "467k", "264k", "251k"].map((token) => {
+		const line = statLines.find((candidate) => candidate.includes(token));
+		return line ? line.indexOf(token) + token.length : -1;
+	});
+	if (tokenEnds.some((column) => column < 0) || new Set(tokenEnds).size !== 1) {
+		fail(`token counts are not right-aligned: ${tokenEnds.join(",")}`);
+	}
+	const compact = renderHudBar(frames, hudWith(45, 200_000, 1.694), false, 120, "tier3_neutral").map(stripLine).join("");
+	if (compact.includes("(+$0.012)") || compact.includes("(+$0.020)")) fail("turn deltas shown when the stats tile is compacted");
+	const roomy = renderHudBar(frames, hudWith(45, 200_000, 1.694), false, 260, "tier3_neutral").map(stripLine).join("");
+	if (!roomy.includes("(+32k)")) fail("per-turn cache-write token delta missing when the stats tile has room");
+	if (!roomy.includes("(+$0.012)")) fail("per-turn input delta missing when the stats tile has room");
+	if (!roomy.includes("(+$0.020)")) fail("per-turn COST delta missing when the panel has room");
 }
 
 // The inline-image path must not throw outside a real terminal (where pi-tui

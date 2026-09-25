@@ -58,10 +58,14 @@ function slicesIn(line: string): string[] {
 }
 
 const hud: HudData = {
-	health: 55, usagePct: 45, contextTokens: 90_000, window: 200_000, cost: 1.694,
+	health: 55, usagePct: 45, contextTokens: 90_000, window: 200_000, cost: 0.582,
 	stats: [
-		{ label: "CACHE", value: "98%" }, { label: "IN", value: "18.4k" },
-		{ label: "OUT", value: "534" }, { label: "BLENDED", value: "$1.203" },
+		{ label: "CACHE", value: " 326k"},
+		{ label: "CACHE READ", value: "37.2m $0.372" },
+		{ label: "CACHE WRITE", value: " 467k $0.058" },
+		{ label: "IN", value: " 264k $0.026" },
+		{ label: "OUT", value: " 251k $0.125" },
+		{ label: "BLENDED", value: "$0.015/M" },
 	],
 	modelId: "claude-opus-4-5", thinking: "high", provider: "anthropic",
 	branch: "main", dir: "my-project",

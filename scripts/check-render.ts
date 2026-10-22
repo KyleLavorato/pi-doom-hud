@@ -4,7 +4,7 @@
 //
 //   npm test
 import { loadFrames, renderHudBar } from "../extensions/doom-hud/index.ts";
-import { billedTokenCount, blendedCostPerMillion, promptTokenCount } from "../extensions/doom-hud/token-economics.ts";
+import { billedTokenCount, blendedCostPerMillion, costColumnValue, promptTokenCount } from "../extensions/doom-hud/token-economics.ts";
 import type { HudData } from "../extensions/doom-hud/index.ts";
 
 /** Strip SGR/mode escapes and count visible columns (every glyph used is width 1). */
@@ -182,6 +182,36 @@ for (let width = 24; width <= 260; width++) {
 	if (!roomy.includes("(+32k)")) fail("per-turn cache-write token delta missing when the stats tile has room");
 	if (!roomy.includes("(+$0.012)")) fail("per-turn input delta missing when the stats tile has room");
 	if (!roomy.includes("(+$0.020)")) fail("per-turn COST delta missing when the panel has room");
+}
+
+// CARRY is the provenance row for cost adopted from a carry block. It renders
+// last, below OTHER, so adopting a carry never reflows the rows above it, and
+// both together have to fit the tile's eight interior rows instead of spilling.
+{
+	const stripLine = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+	const hud = hudWith(45, 200_000, 4.106);
+	hud.stats.push({ label: "OTHER", value: costColumnValue(5, 1.113) });
+	hud.stats.push({ label: "CARRY", value: costColumnValue(5, 3.41) });
+	const lines = renderHudBar(frames, hud, false, 140, "tier3_neutral");
+	const statLines = lines.map(stripLine);
+	const wide = statLines.join("\n");
+	for (const needle of ["OTHER", "$1.113", "CARRY", "$3.410"]) {
+		if (!wide.includes(needle)) fail(`carry reading \"${needle}\" missing at 140 columns`);
+	}
+	// Every amount, the cost-only rows included, lands in one column.
+	const columns = ["$0.372", "$0.058", "$0.026", "$0.125", "$1.113", "$3.410"].map((marker) => {
+		const line = statLines.find((candidate) => candidate.includes(marker));
+		return line ? line.indexOf(marker) : -1;
+	});
+	if (columns.some((column) => column < 0) || new Set(columns).size !== 1) {
+		fail(`cost-only rows are not in the bucket cost column: ${columns.join(",")}`);
+	}
+	const otherRow = statLines.findIndex((line) => line.includes("OTHER"));
+	const carryRow = statLines.findIndex((line) => line.includes("CARRY"));
+	if (otherRow < 0 || carryRow < 0 || carryRow <= otherRow) fail("CARRY should render below OTHER");
+	for (const line of lines) {
+		if (visible(line) !== 140) fail("a carry row pushed the bar off the terminal width");
+	}
 }
 
 // The inline-image path must not throw outside a real terminal (where pi-tui

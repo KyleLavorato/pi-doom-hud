@@ -60,6 +60,14 @@
  *               this is activity, not the provider's resident cache size.
  *     CACHE READ / CACHE WRITE / IN / OUT = token count plus spend for each bucket
  *     BLENDED = usage cost per million billed tokens; OTHER shows unbucketed spend.
+ *     CARRY   = the part of COST adopted from a carry block (see below).
+ *
+ * Cost carry-over lets one session's spend continue in another. A markdown
+ * document opts in with the line `<!-- doom-hud:carry -->`; writing or editing it
+ * stamps this session's totals into a fenced `doom-hud-carry` block under the
+ * marker, and reading such a block adopts those totals as a custom session entry.
+ * The block format, the stamping rules and the adopt guards live in cost-carry.ts;
+ * this file only wires them to write/edit and read, and renders the CARRY row.
  *
  * Context colours follow pi's footer thresholds: 90%+ red, 70%+ amber,
  * otherwise green, with a dim dash when usage is unknown (right after a
@@ -77,17 +85,34 @@
  *   /doomhud        toggle the HUD on/off
  *   /doomhud image  force the real pixel face (where supported)
  *   /doomhud text   force the half-block face
+ *   /doomhud carry stamp <file>  stamp this session's totals into a document
+ *   /doomhud carry clear         drop an adopted carry for this session
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
-import { encodeKitty, getCapabilities, getCellDimensions, visibleWidth } from "@earendil-works/pi-tui";
-import { readFile, readdir } from "node:fs/promises";
-import { join, dirname, basename } from "node:path";
+import { Text, encodeKitty, getCapabilities, getCellDimensions, visibleWidth } from "@earendil-works/pi-tui";
+import { readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { join, dirname, basename, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { inflateSync, deflateSync } from "node:zlib";
 import { execSync } from "node:child_process";
-import { billedTokenCount, blendedCostPerMillion } from "./token-economics.ts";
+import { billedTokenCount, blendedCostPerMillion, costColumnValue } from "./token-economics.ts";
+import {
+	CARRY_CUSTOM_TYPE,
+	CARRY_MARKER,
+	CARRY_VERSION,
+	adoptDecision,
+	carryCostTotal,
+	hasCarryMarker,
+	normalizeCarryUsage,
+	parseCarryBlock,
+	stampCarry,
+	zeroUsage,
+	type CarryEntryData,
+	type CarryPayload,
+	type CarryUsage,
+} from "./cost-carry.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -560,23 +585,65 @@ function turnCostDeltaFromMessages(messages: readonly unknown[]): TurnCostDelta 
 }
 
 /**
- * Gather all the live stats the HUD needs. Mirrors pi's footer logic for cost
- * (session entries + subagent artifacts) and adds token/usage/tool/message
- * counts. Everything is guarded so a missing model/usage/branch never throws.
+ * Cumulative usage for one session: every usage-bearing entry, plus the adopted
+ * cost carry when there is one. This is the single place the HUD's COST math and
+ * a stamped carry block's numbers both come from, so the two can never drift.
  */
-function collectHudData(
-	ctx: ExtensionContext,
-	entries: readonly unknown[],
-	subagentCost: number,
-	turnDelta: TurnCostDelta | null = null,
-): HudData {
-	const usage = ctx.getContextUsage();
-	const usagePct = usage?.percent != null ? Math.round(usage.percent) : null;
-	const contextTokens = finiteNumber(usage?.tokens) ?? null;
-	// The face still runs on remaining health, so unknown usage counts as full
-	// health (a fresh window) rather than no health.
-	const health = Math.max(0, Math.min(100, 100 - (usagePct ?? 0)));
+export interface SessionUsageTotals {
+	tokensIn: number;
+	tokensOut: number;
+	cacheRead: number;
+	cacheWrite: number;
+	billedTokens: number;
+	inputCost: number;
+	outputCost: number;
+	cacheReadCost: number;
+	cacheWriteCost: number;
+	/** Usage spend across every bucket, excluding subagent spend. */
+	tokenCost: number;
+	/** The latest request's cache-read count, or null when there is none yet. */
+	latestCacheRead: number | null;
+	/** The adopted carry, or null. */
+	carry: CarryEntryData | null;
+	/** tokenCost plus subagent spend. */
+	cost: number;
+}
 
+/**
+ * The carry entry in force for a session, or null. The latest one wins, which is
+ * what makes `/doomhud carry clear` work: it appends a zeroed entry that
+ * supersedes the adopted one instead of rewriting history.
+ */
+export function activeCarry(entries: readonly unknown[]): CarryEntryData | null {
+	let carry: CarryEntryData | null = null;
+	for (const item of entries) {
+		const entry = item as Record<string, any>;
+		if (entry.type !== "custom" || entry.customType !== CARRY_CUSTOM_TYPE) continue;
+		const data = entry.data as Record<string, any> | undefined;
+		const usage = normalizeCarryUsage(data?.usage);
+		if (!usage) continue;
+		carry = {
+			v: CARRY_VERSION,
+			capturedAt: typeof data?.capturedAt === "string" ? data.capturedAt : "",
+			sessionId: typeof data?.sessionId === "string" ? data.sessionId : "",
+			...(typeof data?.model === "string" ? { model: data.model } : {}),
+			usage,
+			...(typeof data?.adoptedFrom === "string" ? { adoptedFrom: data.adoptedFrom } : {}),
+			...(typeof data?.adoptedAt === "string" ? { adoptedAt: data.adoptedAt } : {}),
+		};
+	}
+	return carry;
+}
+
+/** Whether this session already carries cost, cleared or not, for the adopt guards. */
+function hasCarry(entries: readonly unknown[]): boolean {
+	return entries.some((item) => {
+		const entry = item as Record<string, any>;
+		return entry.type === "custom" && entry.customType === CARRY_CUSTOM_TYPE;
+	});
+}
+
+export function sumSessionUsage(entries: readonly unknown[], subagentCost: number): SessionUsageTotals {
 	// Cumulative session totals. CACHE and BLENDED use the same session window;
 	// Pi's footer CH value is per-request and can differ.
 	let tokensIn = 0;
@@ -589,7 +656,6 @@ function collectHudData(
 	let outputCost = 0;
 	let cacheReadCost = 0;
 	let cacheWriteCost = 0;
-	let cost = 0;
 	// Spend and provider-reported token totals from every usage-bearing entry.
 	// Subagent spend is separate because its token counts are unavailable here.
 	let tokenCost = 0;
@@ -641,7 +707,102 @@ function collectHudData(
 			addUsage((msg as { usage?: AssistantUsage }).usage);
 		}
 	}
-	cost = tokenCost + subagentCost;
+	// The carried usage folds into the same accumulators as live usage, so IN,
+	// OUT, CACHE READ, CACHE WRITE and BLENDED all carry across a handoff. Its
+	// cost.total can exceed its buckets when the producing session ran subagents,
+	// and that gap reads as OTHER exactly as live subagent spend does.
+	const carry = activeCarry(entries);
+	if (carry) addUsage(carry.usage as AssistantUsage);
+	return {
+		tokensIn,
+		tokensOut,
+		cacheRead,
+		cacheWrite,
+		billedTokens,
+		inputCost,
+		outputCost,
+		cacheReadCost,
+		cacheWriteCost,
+		tokenCost,
+		latestCacheRead,
+		carry,
+		cost: tokenCost + subagentCost,
+	};
+}
+
+/**
+ * Flatten a tool result's content blocks to text. Used by the read hook, which
+ * looks for a carry block in what the agent just read.
+ */
+function textOfContent(content: unknown): string {
+	if (typeof content === "string") return content;
+	if (!Array.isArray(content)) return "";
+	let out = "";
+	for (const part of content) {
+		if (part && typeof part === "object" && (part as { type?: unknown }).type === "text") {
+			out += String((part as { text?: unknown }).text ?? "");
+		}
+	}
+	return out;
+}
+
+/**
+ * The usage a stamped block records: this session's totals, including any carry
+ * already adopted, so a chain of handoffs keeps accumulating instead of
+ * resetting to the last hop.
+ */
+export function carryUsageFrom(totals: SessionUsageTotals, subagentCost: number): CarryUsage {
+	return {
+		input: totals.tokensIn,
+		output: totals.tokensOut,
+		cacheRead: totals.cacheRead,
+		cacheWrite: totals.cacheWrite,
+		cost: {
+			input: totals.inputCost,
+			output: totals.outputCost,
+			cacheRead: totals.cacheReadCost,
+			cacheWrite: totals.cacheWriteCost,
+			// Includes the carry already folded into tokenCost, plus subagent spend.
+			total: totals.tokenCost + subagentCost,
+		},
+	};
+}
+
+/**
+ * Gather all the live stats the HUD needs. Mirrors pi's footer logic for cost
+ * (session entries + subagent artifacts) and adds token/usage/tool/message
+ * counts. Everything is guarded so a missing model/usage/branch never throws.
+ */
+function collectHudData(
+	ctx: ExtensionContext,
+	entries: readonly unknown[],
+	subagentCost: number,
+	turnDelta: TurnCostDelta | null = null,
+): HudData {
+	const usage = ctx.getContextUsage();
+	const usagePct = usage?.percent != null ? Math.round(usage.percent) : null;
+	const contextTokens = finiteNumber(usage?.tokens) ?? null;
+	// The face still runs on remaining health, so unknown usage counts as full
+	// health (a fresh window) rather than no health.
+	const health = Math.max(0, Math.min(100, 100 - (usagePct ?? 0)));
+
+	// Everything below comes from one aggregation helper, so the numbers in the
+	// bar and the numbers in a stamped carry block cannot diverge.
+	const {
+		tokensIn,
+		tokensOut,
+		cacheRead,
+		cacheWrite,
+		billedTokens,
+		inputCost,
+		outputCost,
+		cacheReadCost,
+		cacheWriteCost,
+		tokenCost,
+		latestCacheRead,
+		carry,
+		cost,
+	} = sumSessionUsage(entries, subagentCost);
 
 	const window = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 	const thinking = ctx.thinkingLevel ?? "off";
@@ -653,6 +814,10 @@ function collectHudData(
 	);
 	const tokenCostValue = (tokens: number, amount: number): string =>
 		`${fmtUsageTokens(tokens).padStart(tokenColumnWidth)} $${amount.toFixed(3)}`;
+	// Cost-only rows (OTHER, CARRY) have no token count to print, so they pad an
+	// empty token column instead, keeping their dollars in the same column as the
+	// bucket rows above them.
+	const costOnlyValue = (amount: number): string => costColumnValue(tokenColumnWidth, amount);
 	const perMillion = blendedCostPerMillion(tokenCost, billedTokens);
 	const bucketCost = inputCost + cacheReadCost + cacheWriteCost + outputCost;
 	const otherCost = Math.max(0, cost - bucketCost);
@@ -665,7 +830,12 @@ function collectHudData(
 		{ label: "OUT", value: tokenCostValue(tokensOut, outputCost), deltaCost: turnDelta?.output },
 		{ label: "BLENDED", value: perMillion > 0 ? `$${perMillion.toFixed(3)}/M` : "---" },
 	];
-	if (otherCost > 0.0000005) stats.push({ label: "OTHER", value: `$${otherCost.toFixed(3)}`, deltaCost: turnDelta?.other });
+	if (otherCost > 0.0000005) stats.push({ label: "OTHER", value: costOnlyValue(otherCost), deltaCost: turnDelta?.other });
+	// Provenance for the carried part of COST, kept last so adopting a carry never
+	// reflows the rows above it. It and OTHER together exactly fill the tile's
+	// eight interior rows, so this cannot push anything off the panel.
+	const carriedCost = carryCostTotal(carry);
+	if (carriedCost > 0.0000005) stats.push({ label: "CARRY", value: costOnlyValue(carriedCost) });
 
 	// The MODEL tile shows the model id, broken on "-", with the thinking level
 	// on its own line underneath and the provider beneath that.
@@ -2012,6 +2182,97 @@ export default async function (pi: ExtensionAPI) {
 		});
 	}
 
+	// ── Cost carry-over ──────────────────────────────────────────────────────
+	// cost-carry.ts owns the document contract; the extension only wires it to
+	// the session: stamp on write/edit, adopt on read, persist as a custom entry.
+	// appendEntry and registerEntryRenderer are guarded so an older pi keeps a
+	// working bar instead of failing to load the extension over the new feature.
+	const canPersistCarry = typeof pi.appendEntry === "function";
+
+	function notify(ctx: ExtensionContext, message: string, type: "info" | "warning" | "error" = "info"): void {
+		if (!ctx.hasUI) return;
+		ctx.ui.notify(message, type);
+	}
+
+	/** What a stamped block records for this session right now. */
+	function carryPayloadFor(ctx: ExtensionContext): CarryPayload {
+		const subagentCost = subagentCostTotal();
+		const totals = sumSessionUsage(ctx.sessionManager.getEntries(), subagentCost);
+		return {
+			v: CARRY_VERSION,
+			capturedAt: new Date().toISOString(),
+			sessionId: ctx.sessionManager.getSessionId(),
+			...(ctx.model ? { model: `${ctx.model.provider}/${ctx.model.id}` } : {}),
+			usage: carryUsageFrom(totals, subagentCost),
+		};
+	}
+
+	interface StampOutcome {
+		outcome: "stamped" | "unchanged" | "no-marker" | "unreadable" | "too-large" | "skipped" | "failed";
+		amount?: number;
+	}
+
+	/**
+	 * Documents above this are not handoff notes. The cap keeps an edit to a large
+	 * file from turning into a full read on every edit, since the marker can only
+	 * be found by looking.
+	 */
+	const CARRY_MAX_DOC_BYTES = 1 << 20;
+
+	/** Put this session's totals into a document that opted in with the marker. */
+	async function stampDocument(path: string, ctx: ExtensionContext): Promise<StampOutcome> {
+		let text: string;
+		try {
+			if ((await stat(path)).size > CARRY_MAX_DOC_BYTES) return { outcome: "too-large" };
+			text = await readFile(path, "utf8");
+		} catch {
+			return { outcome: "unreadable" };
+		}
+		if (!hasCarryMarker(text)) return { outcome: "no-marker" };
+		const payload = carryPayloadFor(ctx);
+		const amount = carryCostTotal(payload);
+		const stamped = stampCarry(text, payload);
+		if (!stamped.changed) return { outcome: "unchanged", amount };
+		try {
+			// Optimistic concurrency: if the file moved since the read, another write or
+			// edit is in flight and will trigger its own stamp. Dropping this one is
+			// safer than overwriting that change with our now-stale copy.
+			if ((await readFile(path, "utf8")) !== text) return { outcome: "skipped", amount };
+			await writeFile(path, stamped.text, "utf8");
+		} catch {
+			return { outcome: "failed" };
+		}
+		return { outcome: "stamped", amount };
+	}
+
+	/**
+	 * Adopt a carry block out of a document the agent read. One carry per session:
+	 * any existing carry entry blocks adoption, including the zeroed tombstone that
+	 * `carry clear` appends, so a cleared session stays cleared.
+	 */
+	function adoptCarry(text: string, path: string, ctx: ExtensionContext): boolean {
+		if (!canPersistCarry) return false;
+		const payload = parseCarryBlock(text);
+		if (!payload) return false;
+		const decision = adoptDecision(
+			payload,
+			ctx.sessionManager.getSessionId(),
+			hasCarry(ctx.sessionManager.getEntries()),
+		);
+		if (decision !== "adopt") return false;
+		// A block recording nothing (a handoff written before any spend) has nothing
+		// to carry, and adopting it would block a real one later in the session.
+		if (carryCostTotal(payload) <= 0.0000005) return false;
+		pi.appendEntry<CarryEntryData>(CARRY_CUSTOM_TYPE, {
+			...payload,
+			adoptedFrom: path,
+			adoptedAt: new Date().toISOString(),
+		});
+		refresh();
+		notify(ctx, `Doom HUD: adopted $${carryCostTotal(payload).toFixed(3)} carried cost from ${basename(path)}`);
+		return true;
+	}
+
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
 		ctxRef = ctx;
@@ -2047,6 +2308,43 @@ export default async function (pi: ExtensionAPI) {
 		"session_compact_failed", (_e, c) => { ctxRef = c; active?.setCompacting(false); refresh(); });
 
 	pi.on("agent_start", (_e, c) => { ctxRef = c; lastTurnCostDelta = null; refresh(); });
+	// Cost carry-over. A document that opted in with the marker gets this
+	// session's totals stamped into it whenever it is written or edited, so a
+	// handoff doc always carries current numbers. Documents written through bash
+	// are out of scope: a shell command reports no reliable list of what it
+	// touched. Reading a document that already holds a block adopts it, which is
+	// how the next session resumes the cost.
+	pi.on("tool_result", async (event, ctx) => {
+		const input = event.input as { path?: unknown; content?: unknown } | undefined;
+		const given = typeof input?.path === "string" ? input.path : null;
+		if (!given || event.isError) return;
+		// The tools resolve their path against the session cwd (ctx.cwd), not the
+		// process cwd, so the hooks have to do the same or a relative handoff path
+		// would be read and stamped somewhere else entirely.
+		const path = resolve(ctx.cwd, given);
+		if (event.toolName === "read") {
+			if (adoptCarry(textOfContent(event.content), path, ctx)) return;
+			// A truncated read can cut the block off the end of a long document, so
+			// re-read the file only when the result says it was truncated.
+			const truncated = Boolean((event as { details?: { truncation?: { truncated?: boolean } } }).details?.truncation?.truncated);
+			if (!truncated) return;
+			const full = await readFile(path, "utf8").catch(() => null);
+			if (full !== null) adoptCarry(full, path, ctx);
+			return;
+		}
+		if (event.toolName !== "write" && event.toolName !== "edit") return;
+		// A write carries the whole file, so a document without the marker can be
+		// skipped without touching the disk at all. An edit does not carry the whole
+		// file, so it falls through to the size-capped read.
+		if (event.toolName === "write" && typeof input?.content === "string" && !hasCarryMarker(input.content)) return;
+		const result = await stampDocument(path, ctx);
+		if (result.outcome === "stamped") {
+			notify(ctx, `Doom HUD: stamped $${(result.amount ?? 0).toFixed(3)} into ${basename(given)}`);
+		} else if (result.outcome === "failed") {
+			notify(ctx, `Doom HUD: could not stamp ${basename(given)}`, "warning");
+		}
+	});
+
 	pi.on("agent_end", (event, c) => {
 		ctxRef = c;
 		lastTurnCostDelta = turnCostDeltaFromMessages(event.messages);
@@ -2070,11 +2368,66 @@ export default async function (pi: ExtensionAPI) {
 		active = null; ctxRef = null;
 	});
 
+	// The adopted carry is invisible unless it renders itself: pi draws nothing
+	// for a custom entry with no renderer. One dim line records where the cost
+	// came from, and it survives resume and the rebuild after compaction.
+	if (typeof pi.registerEntryRenderer === "function") pi.registerEntryRenderer<CarryEntryData>(CARRY_CUSTOM_TYPE, (entry, _options, theme) => {
+		const total = carryCostTotal(entry.data);
+		if (total <= 0.0000005) return undefined; // a cleared carry draws nothing
+		const from = entry.data?.adoptedFrom ? ` from ${entry.data.adoptedFrom}` : "";
+		return new Text(theme.fg("dim", `cost carried: $${total.toFixed(3)}${from}`), 1, 0);
+	});
+
 	pi.registerCommand("doomhud", {
-		description: "Toggle the Doom HUD. /doomhud image|text|natural|0-100.",
+		description: "Toggle the Doom HUD. /doomhud image|text|natural|carry|0-100.",
 		handler: async (args, ctx) => {
-			const a = (args ?? "").trim().toLowerCase();
+			// Paths are case-sensitive, so only the command word is folded.
+			const raw = (args ?? "").trim();
+			const a = raw.toLowerCase();
 			const numericArg = /^[-+]?\d+$/.test(a) ? Number(a) : null;
+			if (a === "carry" || a.startsWith("carry ")) {
+				const rest = raw.slice("carry".length).trim();
+				const [verb = "", ...tail] = rest.length > 0 ? rest.split(/\s+/) : [];
+				const sub = verb.toLowerCase();
+				const target = tail.join(" ");
+				if (sub === "clear") {
+					if (!canPersistCarry) {
+						notify(ctx, "Doom HUD: this pi version cannot store a carry", "warning");
+						return;
+					}
+					// A zeroed entry supersedes any adopted carry rather than rewriting the
+					// session, and it keeps adoption off for the rest of the session.
+					pi.appendEntry<CarryEntryData>(CARRY_CUSTOM_TYPE, {
+						v: CARRY_VERSION,
+						capturedAt: new Date().toISOString(),
+						sessionId: ctx.sessionManager.getSessionId(),
+						usage: zeroUsage(),
+						adoptedAt: new Date().toISOString(),
+					});
+					refresh();
+					notify(ctx, "Doom HUD: carried cost cleared for this session");
+				} else if (sub === "stamp") {
+					const result = target ? await stampDocument(resolve(ctx.cwd, target), ctx) : null;
+					if (!target) {
+						notify(ctx, "Doom HUD: /doomhud carry stamp <file> | carry clear", "warning");
+					} else if (result?.outcome === "stamped") {
+						notify(ctx, `Doom HUD: stamped $${(result.amount ?? 0).toFixed(3)} into ${target}`);
+					} else if (result?.outcome === "unchanged") {
+						notify(ctx, `Doom HUD: ${target} already carries $${(result.amount ?? 0).toFixed(3)}`);
+					} else if (result?.outcome === "no-marker") {
+						notify(ctx, `Doom HUD: ${target} has no ${CARRY_MARKER} marker`, "warning");
+					} else if (result?.outcome === "too-large") {
+						notify(ctx, `Doom HUD: ${target} is too large to be a carry document`, "warning");
+					} else if (result?.outcome === "skipped") {
+						notify(ctx, `Doom HUD: ${target} changed while stamping, try again`, "warning");
+					} else {
+						notify(ctx, `Doom HUD: could not write ${target}`, "warning");
+					}
+				} else {
+					notify(ctx, "Doom HUD: /doomhud carry stamp <file> | carry clear", sub ? "warning" : "info");
+				}
+				return;
+			}
 			if (numericArg !== null) {
 				if (!Number.isInteger(numericArg) || numericArg < 0 || numericArg > 100) {
 					ctx.ui.notify("Doom HUD: test health must be an integer from 0 to 100", "warning");

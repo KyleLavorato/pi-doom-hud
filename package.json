@@ -1,6 +1,6 @@
 {
   "name": "pi-doom-hud",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Doom-style Pi status bar with a high-resolution image face, universal quadrant-block fallback, live context and cost stats, and test-health controls",
   "type": "module",
   "license": "MIT",
@@ -36,7 +36,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "tsx scripts/check-render.ts && tsx scripts/check-image.ts",
+    "test": "tsx scripts/check-render.ts && tsx scripts/check-image.ts && tsx scripts/check-carry.ts",
     "typecheck": "tsc --noEmit",
     "preview": "tsx scripts/preview.ts"
   },

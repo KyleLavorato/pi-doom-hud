@@ -21,7 +21,7 @@ Restart or reload Pi. The HUD prefers the high-resolution image face by default 
 | MODEL | The model id with the thinking level underneath and the provider as a caption. |
 | FACE | The Doom Guy. Health is `100 - context usage`, mapped onto the five classic health tiers. |
 | COST | Session spend in USD to three decimals, including compaction, branch-summary, and subagent spend. |
-| CACHE / CACHE READ / CACHE WRITE / IN / OUT / BLENDED | CACHE shows the latest request's cache-read count plus cache-write tokens from the last completed agent run; this is activity, not resident cache size. Usage records do not include a cache-entry expiry time. The other rows show session token counts and USD cost by bucket, plus spend per million billed tokens. Costs are rounded to three decimals and aligned in one column. Green per-turn deltas appear only when the stats tile has room. OTHER shows spend without matching token totals, such as subagent cost, which BLENDED excludes. |
+| CACHE / CACHE READ / CACHE WRITE / IN / OUT / BLENDED | CACHE shows the latest request's cache-read count plus cache-write tokens from the last completed agent run; this is activity, not resident cache size. Usage records do not include a cache-entry expiry time. The other rows show session token counts and USD cost by bucket, plus spend per million billed tokens. Costs are rounded to three decimals and aligned in one column. Green per-turn deltas appear only when the stats tile has room. OTHER shows spend without matching token totals, such as subagent cost, which BLENDED excludes. CARRY shows the part of COST adopted from a carry block (see [Cost Carry-Over](#cost-carry-over)). |
 
 The tiles have their own size constraints so in smaller terminals, the tile with the most extra space will begin to compact first. This ensures as much data as possible is always visible.
 
@@ -45,6 +45,8 @@ The extension works everywhere. The half-block face is the text fallback and is 
 - `/doomhud text` — Use the half-block face
 - `/doomhud <0-100>` — Set Doom Guy's health; it affects only the face and clears when the context token count changes
 - `/doomhud natural` — Clear a test-health override immediately
+- `/doomhud carry stamp <file>`: Stamp this session's cost into a document that opted in with the marker
+- `/doomhud carry clear`: Drop an adopted carry for the rest of this session
 
 ## Compatibility
 
@@ -54,6 +56,41 @@ The extension works everywhere. The half-block face is the text fallback and is 
 ## How Cost is Evaluated
 
 Cost usage is summed using Pi's stable usage fields (`input`, `output`, `cacheRead`, `cacheWrite`, and `cost.total`), plus usage entries, compaction calls, and branch-summary calls when those entries provide usage. Missing optional usage is treated as zero. The HUD does not depend on provider-specific pricing fields. Subagent children are separate pi processes whose spend never reaches this session's entries, so their cost is read from the `subagent-artifacts` directory pi-subagents writes next to the session file, cached per run and resolved asynchronously.
+
+## Cost Carry-Over
+
+COST normally restarts at zero in a new session, which means a handoff throws away the one number that says what the work cost so far. Cost carry-over fixes that by writing a session's totals into a document and reading them back in the next session. End a handoff document with the marker and the loop closes itself: the session writing the handoff stamps its totals, and the next session resumes the cost as soon as it reads that document.
+
+### The contract
+
+A document opts in by containing this line, exactly as written:
+
+```markdown
+<!-- doom-hud:carry -->
+```
+
+When the HUD sees that document written or edited, it keeps the marker and puts the session's totals in a fenced block underneath:
+
+````markdown
+<!-- doom-hud:carry -->
+```json doom-hud-carry
+{
+  "v": 1,
+  "capturedAt": "2026-09-24T21:03:00.000Z",
+  "sessionId": "a1b2c3",
+  "model": "anthropic/claude-sonnet-4-5",
+  "usage": {
+    "input": 412000,
+    "output": 18000,
+    "cacheRead": 9300000,
+    "cacheWrite": 210000,
+    "cost": { "input": 1.24, "output": 0.54, "cacheRead": 0.93, "cacheWrite": 0.42, "total": 3.41 }
+  }
+}
+```
+````
+
+Any markdown document can carry this block: a handoff note, a plan, a ticket export, an appendix. Nothing else about the document matters, and no filename pattern triggers anything.
 
 ## Development
 

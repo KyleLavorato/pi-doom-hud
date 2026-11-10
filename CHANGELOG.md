@@ -4,6 +4,16 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.1]
+
+### Fixed
+
+- The bar is now the bottom-most line on screen. It renders in pi's footer slot
+  instead of as a below-editor widget, so it stays below the editor and below
+  the subagent fleet roster and every other below-editor widget. Widgets are
+  ordered by registration time, which meant a later extension (for example the
+  subagent roster) pushed the bar up the screen.
+
 ## [1.1.0]
 
 ### Added

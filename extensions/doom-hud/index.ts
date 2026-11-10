@@ -2278,20 +2278,20 @@ export default async function (pi: ExtensionAPI) {
 		ctxRef = ctx;
 		lastTurnCostDelta = null;
 		DoomHudComponent.resetTransient();
-		// Replace pi's built-in status footer; the HUD already presents its useful stats.
-		ctx.ui.setFooter(() => ({ render: () => [], invalidate() {} }));
-		ctx.ui.setWidget(
-			"doom-hud",
-			(tui, _theme) => {
-				if (!active) {
-					active = new DoomHudComponent(tui, frames);
-					active.start();
-				}
-				active.tui = tui;
-				return active;
-			},
-			{ placement: "belowEditor" },
-		);
+		// The bar replaces pi's built-in status footer and draws in the footer slot
+		// rather than as a belowEditor widget. The footer is the last thing pi
+		// paints, so the HUD stays under the editor, the subagent fleet roster, and
+		// any other below-editor widget no matter which extension registered first.
+		// A widget could only be ordered by registration time, which the HUD loses
+		// every time a later extension adds one.
+		ctx.ui.setFooter((tui) => {
+			if (!active) {
+				active = new DoomHudComponent(tui, frames);
+				active.start();
+			}
+			active.tui = tui;
+			return active;
+		});
 		setTimeout(refresh, 0);
 	});
 
